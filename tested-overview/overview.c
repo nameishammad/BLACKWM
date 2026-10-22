@@ -1,0 +1,848 @@
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
+#include <X11/extensions/Xcomposite.h>
+#include <X11/extensions/Xrender.h>
+#include <X11/extensions/Xfixes.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h> /* strcasestr */
+#include <math.h>
+#include <unistd.h>
+#include <sys/select.h>
+#include <sys/time.h>
+
+#define MAX_WINDOWS 64
+
+typedef struct {
+    Window      win;
+    Pixmap      pixmap;
+    Picture     picture;
+    int         w, h;
+
+    double      dst_x, dst_y, dst_w, dst_h;
+    double      curr_x, curr_y, curr_w, curr_h;
+    double      scale;
+    double      alpha;
+} ClientWin;
+
+static Display *dpy;
+static int       scr;
+static Window    root;
+static Window    overlay = 0;
+static Picture   overlay_pic = 0;
+static Picture   wallpaper_pic = 0;
+static int       screen_w, screen_h;
+
+static ClientWin clients[MAX_WINDOWS];
+static int        nclients = 0;
+static int        selected = 0;
+
+static Atom NET_CLIENT_LIST, NET_ACTIVE_WINDOW;
+static Atom XROOTPMAP_ID, ESETROOT_PMAP_ID;
+
+static const double BG_ALPHA = 0.40;
+
+/* ---------------- Helpers ---------------- */
+
+static int x_error_handler(Display *d, XErrorEvent *e) {
+    (void)d; (void)e;
+    return 0;
+}
+
+static Atom intern(const char *name) { return XInternAtom(dpy, name, False); }
+
+static Window get_currently_focused_window(void) {
+    Window focused = None;
+
+    Atom actual_type; int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+
+    if (XGetWindowProperty(dpy, root, NET_ACTIVE_WINDOW, 0, 1,
+        False, XA_WINDOW, &actual_type, &actual_format,
+        &nitems, &bytes_after, &prop) == Success && prop) {
+        if (nitems > 0) focused = *(Window *)prop;
+        XFree(prop);
+        }
+
+        if (focused == None || focused == PointerRoot || focused == root) {
+            int revert_to;
+            XGetInputFocus(dpy, &focused, &revert_to);
+        }
+
+        return focused;
+}
+
+static int get_client_list(Window **out) {
+    Atom actual_type; int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+
+    int status = XGetWindowProperty(dpy, root, NET_CLIENT_LIST, 0, MAX_WINDOWS,
+                                    False, XA_WINDOW, &actual_type, &actual_format,
+                                    &nitems, &bytes_after, &prop);
+
+    if (status != Success || !prop) { *out = NULL; return 0; }
+    *out = (Window *)prop;
+    return (int)nitems;
+}
+
+static int window_is_viewable(Window w) {
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, w, &wa)) return 0;
+    return wa.map_state == IsViewable;
+}
+
+/* xwinwrap (aur is jaise live-wallpaper tools) root pixmap wali convention
+ * (_XROOTPMAP_ID / ESETROOT_PMAP_ID) follow nahi karte - wo apni khud ki
+ * window me directly video/animation render karte hain, root pe kuch bhi
+ * "advertise" nahi karte. Isliye root pixmap dhoondne ke bajaye seedha
+ * xwinwrap ki window WM_CLASS se dhoondo aur usay normal client window ki
+ * tarah live composite se capture karo. */
+static Window find_wallpaper_window(void) {
+    Window dummy_root, dummy_parent, *children = NULL;
+    unsigned int nchildren = 0;
+    Window found = None;
+
+    if (!XQueryTree(dpy, root, &dummy_root, &dummy_parent, &children, &nchildren))
+        return None;
+
+    /* Pass 1: class-hint match (normal xwinwrap window, non -ov mode) */
+    for (unsigned int i = 0; i < nchildren && found == None; i++) {
+        XClassHint ch;
+        if (XGetClassHint(dpy, children[i], &ch)) {
+            if ((ch.res_name  && strcasestr(ch.res_name,  "xwinwrap")) ||
+                (ch.res_class && strcasestr(ch.res_class, "xwinwrap"))) {
+                found = children[i];
+                }
+                if (ch.res_name)  XFree(ch.res_name);
+                if (ch.res_class) XFree(ch.res_class);
+        }
+    }
+
+    /* Pass 2 (fallback): agar -ov (Composite Overlay Window) mode use ho raha
+     * hai to xwinwrap ki actual render window ka koi WM_CLASS nahi hota, Pass 1
+     * kabhi match nahi karega. Us surat me sabse neeche (bottommost - XQueryTree
+     * children bottom-to-top order me aate hain) jo bhi fullscreen,
+     * override-redirect, viewable window mile usay wallpaper maan lo. */
+    if (found == None) {
+        for (unsigned int i = 0; i < nchildren; i++) {
+            XWindowAttributes wa;
+            if (!XGetWindowAttributes(dpy, children[i], &wa)) continue;
+            if (wa.map_state != IsViewable) continue;
+            if (!wa.override_redirect) continue;
+            if (wa.width < screen_w - 2 || wa.height < screen_h - 2) continue;
+            found = children[i];
+            break; /* pehla match hi bottommost hoga (bottom-to-top order) */
+        }
+    }
+
+    if (found != None) {
+        XClassHint dbg;
+        if (XGetClassHint(dpy, found, &dbg)) {
+            fprintf(stderr, "overview: wallpaper window mila -> 0x%lx (class: %s/%s)\n",
+                    found, dbg.res_name ? dbg.res_name : "?", dbg.res_class ? dbg.res_class : "?");
+            if (dbg.res_name)  XFree(dbg.res_name);
+            if (dbg.res_class) XFree(dbg.res_class);
+        } else {
+            fprintf(stderr, "overview: wallpaper window mila -> 0x%lx (no WM_CLASS, fallback match)\n", found);
+        }
+    } else {
+        fprintf(stderr, "overview: wallpaper window NAHI mila (na class match, na fullscreen override-redirect window)\n");
+    }
+
+    if (children) XFree(children);
+    return found;
+}
+
+static Window   wallpaper_win = 0;
+static Pixmap   wallpaper_pm  = 0;
+/* feh/nitrogen/xsetroot/hsetroot jaise static-wallpaper tools jo pixmap
+ * root window par _XROOTPMAP_ID / ESETROOT_PMAP_ID property se "share" karte
+ * hain (XSetCloseDownMode RetainPermanent), wo pixmap unki apni property hai -
+ * hum sirf ID padh rahe hain, humne khud CreatePixmap nahi kiya. Isliye us
+ * pixmap ko kabhi XFreePixmap NAHI karna - warna user ka actual desktop
+ * wallpaper hi destroy ho jayega. Ye flag batata hai ki wallpaper_pm hamara
+ * apna banaya hua hai (xwinwrap composite capture - jo humein free karna hai)
+ * ya sirf reference hai (static root pixmap - jo humein free nahi karna). */
+static int      wallpaper_pm_owned = 0;
+
+/* xwinwrap jaisa live wallpaper na mile to static root-pixmap wallpaper
+ * dhoondo - ye woh convention hai jo feh/nitrogen/xsetroot/hsetroot follow
+ * karte hain: apna pixmap XSetCloseDownMode(RetainPermanent) se banate hain
+ * aur root window ki _XROOTPMAP_ID (aur legacy ESETROOT_PMAP_ID) property
+ * me uski ID likh dete hain. */
+static Pixmap get_root_pixmap(void) {
+    Atom actual_type; int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+    Pixmap pm = None;
+
+    if (XGetWindowProperty(dpy, root, XROOTPMAP_ID, 0, 1, False, XA_PIXMAP,
+        &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
+        if (nitems > 0) pm = *(Pixmap *)prop;
+        XFree(prop);
+        }
+
+        if (pm == None) {
+            prop = NULL;
+            if (XGetWindowProperty(dpy, root, ESETROOT_PMAP_ID, 0, 1, False, XA_PIXMAP,
+                &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
+                if (nitems > 0) pm = *(Pixmap *)prop;
+                XFree(prop);
+                }
+        }
+
+        return pm;
+}
+
+static void grab_wallpaper_picture(void) {
+    wallpaper_win = find_wallpaper_window();
+
+    if (wallpaper_win != None) {
+        XWindowAttributes wa;
+        if (XGetWindowAttributes(dpy, wallpaper_win, &wa)) {
+            Pixmap pm = XCompositeNameWindowPixmap(dpy, wallpaper_win);
+            if (pm) {
+                XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy, wa.visual);
+                if (fmt) {
+                    XRenderPictureAttributes pa; memset(&pa, 0, sizeof(pa));
+                    Picture pic = XRenderCreatePicture(dpy, pm, fmt, 0, &pa);
+                    if (pic) {
+                        wallpaper_pm  = pm;
+                        wallpaper_pic = pic;
+                        wallpaper_pm_owned = 1;
+                        fprintf(stderr, "overview: live wallpaper (xwinwrap) capture ho gaya\n");
+                        return;
+                    }
+                }
+                XFreePixmap(dpy, pm);
+            }
+        }
+        wallpaper_win = None;
+    }
+
+    /* Fallback: static wallpaper (feh/nitrogen/xsetroot/hsetroot) */
+    Pixmap root_pm = get_root_pixmap();
+    if (root_pm == None) {
+        fprintf(stderr, "overview: na live wallpaper mila, na static root pixmap - background plain rahega\n");
+        return;
+    }
+
+    XWindowAttributes rwa;
+    if (!XGetWindowAttributes(dpy, root, &rwa)) return;
+
+    XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy, rwa.visual);
+    if (!fmt) return;
+
+    XRenderPictureAttributes pa; memset(&pa, 0, sizeof(pa));
+    Picture pic = XRenderCreatePicture(dpy, root_pm, fmt, 0, &pa);
+    if (!pic) return;
+
+    wallpaper_pm  = root_pm;
+    wallpaper_pic = pic;
+    wallpaper_pm_owned = 0; /* shared pixmap - hum owner nahi, isay free nahi karna */
+    fprintf(stderr, "overview: static root-pixmap wallpaper mila (0x%lx)\n", root_pm);
+}
+
+/* Live wallpaper hai to har idle tick pe re-name karo, warna refresh_client_picture
+ * jaisa hi freeze ho jayegi (Present/GPU flip stale pixmap). */
+static void refresh_wallpaper_picture(void) {
+    if (wallpaper_win == None) return;
+
+    Pixmap new_pm = XCompositeNameWindowPixmap(dpy, wallpaper_win);
+    if (!new_pm) return;
+
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, wallpaper_win, &wa)) { XFreePixmap(dpy, new_pm); return; }
+
+    XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy, wa.visual);
+    if (!fmt) { XFreePixmap(dpy, new_pm); return; }
+
+    XRenderPictureAttributes pa; memset(&pa, 0, sizeof(pa));
+    Picture new_pic = XRenderCreatePicture(dpy, new_pm, fmt, 0, &pa);
+    if (!new_pic) { XFreePixmap(dpy, new_pm); return; }
+
+    Picture old_pic = wallpaper_pic;
+    Pixmap  old_pm  = wallpaper_pm;
+
+    wallpaper_pm  = new_pm;
+    wallpaper_pic = new_pic;
+
+    if (old_pic) XRenderFreePicture(dpy, old_pic);
+    if (old_pm)  XFreePixmap(dpy, old_pm);
+}
+
+static int grab_window_picture(ClientWin *c) {
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, c->win, &wa)) return 0;
+    c->w = wa.width; c->h = wa.height;
+    if (c->w <= 10 || c->h <= 10) return 0;
+
+    c->pixmap = XCompositeNameWindowPixmap(dpy, c->win);
+    if (!c->pixmap) return 0;
+
+    XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy, wa.visual);
+    if (!fmt) {
+        XFreePixmap(dpy, c->pixmap);
+        c->pixmap = 0;
+        return 0;
+    }
+
+    XRenderPictureAttributes pa;
+    pa.subwindow_mode = IncludeInferiors;
+    c->picture = XRenderCreatePicture(dpy, c->pixmap, fmt, CPSubwindowMode, &pa);
+    return c->picture != 0;
+}
+
+static void free_client(ClientWin *c) {
+    if (c->picture) { XRenderFreePicture(dpy, c->picture); c->picture = 0; }
+    if (c->pixmap)  { XFreePixmap(dpy, c->pixmap); c->pixmap = 0; }
+}
+
+static void refresh_client_picture(ClientWin *c) {
+    /* GPU se render hone wali windows (mpv vo=gpu waghera) Present extension
+     * se buffer flip karti hain - purana XCompositeNameWindowPixmap wala
+     * pixmap stale ho jata hai. Har refresh cycle pe dobara "name" karo
+     * taake live/current frame dikhe, freeze wala purana frame nahi. */
+    Pixmap new_pm = XCompositeNameWindowPixmap(dpy, c->win);
+    if (!new_pm) return;
+
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, c->win, &wa)) {
+        XFreePixmap(dpy, new_pm);
+        return;
+    }
+
+    XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy, wa.visual);
+    if (!fmt) {
+        XFreePixmap(dpy, new_pm);
+        return;
+    }
+
+    XRenderPictureAttributes pa;
+    pa.subwindow_mode = IncludeInferiors;
+    Picture new_pic = XRenderCreatePicture(dpy, new_pm, fmt, CPSubwindowMode, &pa);
+    if (!new_pic) {
+        XFreePixmap(dpy, new_pm);
+        return;
+    }
+
+    Picture old_pic = c->picture;
+    Pixmap old_pm  = c->pixmap;
+
+    c->pixmap  = new_pm;
+    c->picture = new_pic;
+    c->w = wa.width;
+    c->h = wa.height;
+
+    if (old_pic) XRenderFreePicture(dpy, old_pic);
+    if (old_pm)  XFreePixmap(dpy, old_pm);
+}
+
+/* ---------------- Carousel Layout ---------------- */
+
+static void layout_carousel(void) {
+    if (nclients == 0) return;
+
+    double center_x = screen_w / 2.0;
+    double center_y = screen_h / 2.0;
+
+    double max_h = screen_h * 0.48;
+    double side_scale = 0.65;
+    double spacing = screen_w * 0.25;
+
+    for (int i = 0; i < nclients; i++) {
+        int offset = i - selected;
+
+        double distance = fabs((double)offset);
+        double scale = pow(side_scale, distance);
+        if (scale < 0.3) scale = 0.3;
+
+        /*
+         * IMPORTANT:
+         * Do not upscale small/dialog/polkit windows to the carousel's
+         * max_h. The old code used max_h directly, which meant a 300px
+         * high dialog could suddenly be rendered as a ~500px+ window.
+         *
+         * Large windows are still capped at max_h, while small windows
+         * keep their native size. The carousel side_scale is then applied
+         * on top of that base size.
+         */
+        double base_h = (double)clients[i].h;
+        if (base_h > max_h)
+            base_h = max_h;
+
+        double base_w = base_h * ((double)clients[i].w / (double)clients[i].h);
+
+        clients[i].dst_w = base_w * scale;
+        clients[i].dst_h = base_h * scale;
+
+        if (offset == 0) {
+            clients[i].dst_x = center_x - (clients[i].dst_w / 2.0);
+            clients[i].alpha = 1.0;
+        } else {
+            double direction = (offset > 0) ? 1.0 : -1.0;
+            clients[i].dst_x = center_x + (direction * spacing * pow(distance, 0.85)) - (clients[i].dst_w / 2.0);
+            clients[i].alpha = 0.5 / (distance + 0.2);
+        }
+
+        clients[i].dst_y = center_y - (clients[i].dst_h / 2.0);
+        clients[i].scale = scale;
+    }
+}
+
+/* ---------------- Rendering ---------------- */
+
+static void set_scale_transform(Picture pic, double sx, double sy) {
+    if (sx <= 0.001 || sy <= 0.001) return;
+    XTransform xf; memset(&xf, 0, sizeof(xf));
+    xf.matrix[0][0] = XDoubleToFixed(1.0 / sx);
+    xf.matrix[1][1] = XDoubleToFixed(1.0 / sy);
+    xf.matrix[2][2] = XDoubleToFixed(1.0);
+    XRenderSetPictureTransform(dpy, pic, &xf);
+    XRenderSetPictureFilter(dpy, pic, FilterBilinear, NULL, 0);
+}
+
+static void render_client_to_pic(ClientWin *c, Picture target_pic) {
+    if (!c->picture || c->w <= 0 || c->h <= 0) return;
+
+    int dx = (int)c->curr_x, dy = (int)c->curr_y;
+    int dw = (int)c->curr_w, dh = (int)c->curr_h;
+
+    double sx = (double)dw / (double)c->w;
+    double sy = (double)dh / (double)c->h;
+    set_scale_transform(c->picture, sx, sy);
+
+    XRenderComposite(dpy, PictOpOver, c->picture, None, target_pic,
+                     0, 0, 0, 0, dx, dy, dw, dh);
+}
+
+static void draw_client_border(ClientWin *c, Picture target_pic) {
+    int x = (int)c->curr_x, y = (int)c->curr_y;
+    int w = (int)c->curr_w, h = (int)c->curr_h;
+    if (w <= 0 || h <= 0) return;
+
+    int thickness = 3;
+    if (thickness * 2 > w) thickness = w / 2;
+    if (thickness * 2 > h) thickness = h / 2;
+    if (thickness < 1) thickness = 1;
+
+    /* Border ki alpha window ki apni dim/bright level follow karti hai,
+     * taake center wali window ke around bright border ho aur side
+     * (dabi hui) windows ke around border bhi unhi ke hisaab se dim ho. */
+    double a = c->alpha;
+    if (a > 1.0) a = 1.0;
+    if (a < 0.0) a = 0.0;
+    unsigned short alpha16 = (unsigned short)(a * 65535);
+
+    XRenderColor blue = { 0x3333, 0x88ff, 0xffff, alpha16 };
+
+    XRenderFillRectangle(dpy, PictOpOver, target_pic, &blue, x, y, w, thickness);
+    XRenderFillRectangle(dpy, PictOpOver, target_pic, &blue, x, y + h - thickness, w, thickness);
+    XRenderFillRectangle(dpy, PictOpOver, target_pic, &blue, x, y, thickness, h);
+    XRenderFillRectangle(dpy, PictOpOver, target_pic, &blue, x + w - thickness, y, thickness, h);
+}
+
+static void render_all(void) {
+    /* Flickering khatam karne ke liye Off-screen Backing Store Surface */
+    Pixmap back_pm = XCreatePixmap(dpy, overlay, screen_w, screen_h, 32);
+    XRenderPictFormat *fmt = XRenderFindStandardFormat(dpy, PictStandardARGB32);
+    Picture back_pic = XRenderCreatePicture(dpy, back_pm, fmt, 0, NULL);
+
+    if (wallpaper_pic) {
+        XRenderComposite(dpy, PictOpSrc, wallpaper_pic, None, back_pic,
+                         0, 0, 0, 0, 0, 0, screen_w, screen_h);
+        XRenderColor bg = { 0x0000, 0x0000, 0x0000, (unsigned short)(BG_ALPHA * 65535) };
+        XRenderFillRectangle(dpy, PictOpOver, back_pic, &bg, 0, 0, screen_w, screen_h);
+    } else {
+        XRenderColor bg = { 0x1010, 0x1414, 0x1d1d, 0xffff };
+        XRenderFillRectangle(dpy, PictOpSrc, back_pic, &bg, 0, 0, screen_w, screen_h);
+    }
+
+    if (nclients > 0) {
+        /* Left unselected */
+        for (int i = 0; i < selected; i++) {
+            render_client_to_pic(&clients[i], back_pic);
+            draw_client_border(&clients[i], back_pic);
+        }
+
+        /* Right unselected */
+        for (int i = nclients - 1; i > selected; i--) {
+            render_client_to_pic(&clients[i], back_pic);
+            draw_client_border(&clients[i], back_pic);
+        }
+
+        /* Active selected center window */
+        if (selected >= 0 && selected < nclients) {
+            render_client_to_pic(&clients[selected], back_pic);
+            draw_client_border(&clients[selected], back_pic);
+        }
+    }
+
+    /* Target overlay par single operation se copy (Zero Flickering) */
+    XRenderComposite(dpy, PictOpSrc, back_pic, None, overlay_pic,
+                     0, 0, 0, 0, 0, 0, screen_w, screen_h);
+
+    XRenderFreePicture(dpy, back_pic);
+    XFreePixmap(dpy, back_pm);
+    XFlush(dpy);
+}
+
+/* Smooth Animation Transition Loop */
+static void animate_to_target(void) {
+    layout_carousel();
+
+    for (int frame = 0; frame < 15; frame++) {
+        int done = 1;
+        for (int i = 0; i < nclients; i++) {
+            clients[i].curr_x += (clients[i].dst_x - clients[i].curr_x) * 0.28;
+            clients[i].curr_y += (clients[i].dst_y - clients[i].curr_y) * 0.28;
+            clients[i].curr_w += (clients[i].dst_w - clients[i].curr_w) * 0.28;
+            clients[i].curr_h += (clients[i].dst_h - clients[i].curr_h) * 0.28;
+
+            if (fabs(clients[i].curr_x - clients[i].dst_x) > 0.2) done = 0;
+        }
+        render_all();
+        usleep(8000); /* Smooth ~120FPS pacing */
+        if (done) break;
+    }
+
+    /* Final alignment */
+    for (int i = 0; i < nclients; i++) {
+        clients[i].curr_x = clients[i].dst_x;
+        clients[i].curr_y = clients[i].dst_y;
+        clients[i].curr_w = clients[i].dst_w;
+        clients[i].curr_h = clients[i].dst_h;
+    }
+    render_all();
+}
+
+static int hit_test(int px, int py) {
+    for (int i = 0; i < nclients; i++) {
+        ClientWin *c = &clients[i];
+        if (px >= c->curr_x && px <= c->curr_x + c->curr_w &&
+            py >= c->curr_y && py <= c->curr_y + c->curr_h)
+            return i;
+    }
+    return -1;
+}
+
+static void activate_window(Window w) {
+    XEvent ev; memset(&ev, 0, sizeof(ev));
+    ev.xclient.type = ClientMessage;
+    ev.xclient.window = w;
+    ev.xclient.message_type = NET_ACTIVE_WINDOW;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = 2;
+    ev.xclient.data.l[1] = CurrentTime;
+    XSendEvent(dpy, root, False, SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+    XRaiseWindow(dpy, w);
+    XSetInputFocus(dpy, w, RevertToParent, CurrentTime);
+    XFlush(dpy);
+}
+
+static void teardown_clients(void) {
+    for (int i = 0; i < nclients; i++) free_client(&clients[i]);
+    nclients = 0;
+}
+
+static int build_client_list(Window current_focused_win, int *focused_index_out) {
+    Window *list = NULL;
+    int n = get_client_list(&list);
+    nclients = 0;
+    if (n <= 0) { if (list) XFree(list); return 0; }
+
+    int focused_idx = -1;
+
+    for (int i = 0; i < n && nclients < MAX_WINDOWS; i++) {
+        if (!window_is_viewable(list[i])) continue;
+
+        ClientWin *c = &clients[nclients];
+        memset(c, 0, sizeof(*c));
+        c->win = list[i];
+
+        if (grab_window_picture(c)) {
+            if (c->win == current_focused_win) {
+                focused_idx = nclients;
+            }
+            nclients++;
+        }
+    }
+    XFree(list);
+
+    if (focused_idx == -1) {
+        Window active = get_currently_focused_window();
+
+        for (int i = 0; i < nclients; i++) {
+            if (clients[i].win == active) {
+                focused_idx = i;
+                break;
+            }
+        }
+
+        if (focused_idx == -1)
+            focused_idx = 0;
+    }
+    if (focused_index_out) *focused_index_out = focused_idx;
+    return nclients;
+}
+
+static void create_overlay(void) {
+    XVisualInfo vinfo;
+    if (!XMatchVisualInfo(dpy, scr, 32, TrueColor, &vinfo)) {
+        vinfo.visual = DefaultVisual(dpy, scr);
+        vinfo.depth  = DefaultDepth(dpy, scr);
+    }
+    XSetWindowAttributes swa;
+    swa.override_redirect = True;
+    swa.colormap = XCreateColormap(dpy, root, vinfo.visual, AllocNone);
+    swa.background_pixel = 0;
+    swa.border_pixel = 0;
+    swa.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask |
+    ButtonPressMask | PointerMotionMask | StructureNotifyMask;
+    overlay = XCreateWindow(dpy, root, 0, 0, screen_w, screen_h, 0,
+                            vinfo.depth, InputOutput, vinfo.visual,
+                            CWOverrideRedirect | CWColormap | CWBackPixel |
+                            CWBorderPixel | CWEventMask, &swa);
+    XRenderPictFormat *ofmt = XRenderFindVisualFormat(dpy, vinfo.visual);
+    XRenderPictureAttributes opa; memset(&opa, 0, sizeof(opa));
+    overlay_pic = XRenderCreatePicture(dpy, overlay, ofmt, 0, &opa);
+
+    grab_wallpaper_picture();
+
+    XMapRaised(dpy, overlay);
+}
+
+static void destroy_overlay(void) {
+    if (wallpaper_pic) { XRenderFreePicture(dpy, wallpaper_pic); wallpaper_pic = 0; }
+    if (wallpaper_pm && wallpaper_pm_owned) { XFreePixmap(dpy, wallpaper_pm); }
+    wallpaper_pm = 0;
+    wallpaper_pm_owned = 0;
+    wallpaper_win = 0;
+    if (overlay_pic) { XRenderFreePicture(dpy, overlay_pic); overlay_pic = 0; }
+    if (overlay) { XDestroyWindow(dpy, overlay); overlay = 0; }
+}
+
+static Window run_switcher(Window focused, int offset_direction) {
+    int focused_idx = 0;
+
+    if (build_client_list(focused, &focused_idx) == 0)
+        return None;
+
+    selected = focused_idx;
+
+    if (offset_direction != 0 && nclients > 0) {
+        selected = (selected + offset_direction + nclients) % nclients;
+    }
+
+    create_overlay();
+    layout_carousel();
+
+    for (int i = 0; i < nclients; i++) {
+        clients[i].curr_x = clients[i].dst_x;
+        clients[i].curr_y = clients[i].dst_y;
+        clients[i].curr_w = clients[i].dst_w;
+        clients[i].curr_h = clients[i].dst_h;
+    }
+
+    /* Hotkey daemon (sxhkd etc.) abhi tak keyboard grab hold kar sakta hai
+     * jab tak trigger key release nahi hoti. Isliye single attempt fail ho
+     * sakta hai (AlreadyGrabbed) - chand dafa retry karo before giving up. */
+    int kb_ok = 0, ptr_ok = 0;
+    for (int attempt = 0; attempt < 20 && !kb_ok; attempt++) {
+        int r = XGrabKeyboard(dpy, overlay, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+        if (r == GrabSuccess) { kb_ok = 1; break; }
+        usleep(10000); /* 10ms */
+    }
+
+    for (int attempt = 0; attempt < 20 && !ptr_ok; attempt++) {
+        int r = XGrabPointer(dpy, overlay, True, ButtonPressMask | PointerMotionMask,
+                             GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+        if (r == GrabSuccess) { ptr_ok = 1; break; }
+        usleep(10000);
+    }
+
+    if (!kb_ok) {
+        /* Keyboard grab na mile to overlay kabhi keys receive nahi karega
+         * aur program hang ho jayega - is se behtar hai saaf nikal jayen. */
+        fprintf(stderr, "overview: keyboard grab fail ho gaya, exiting cleanly\n");
+        if (ptr_ok) XUngrabPointer(dpy, CurrentTime);
+        destroy_overlay();
+        teardown_clients();
+        XFlush(dpy);
+        return None;
+    }
+
+    render_all();
+
+    Window result = None;
+    int running = 1;
+    int xfd = ConnectionNumber(dpy);
+    unsigned int idle_frame = 0;
+
+    while (running) {
+        /* Pehle jitne bhi events queue me pending hain wo drain karo */
+        while (XPending(dpy)) {
+            XEvent e;
+            XNextEvent(dpy, &e);
+
+            switch (e.type) {
+                case Expose:
+                    render_all();
+                    break;
+
+                case MotionNotify: {
+                    int hit = hit_test(e.xmotion.x, e.xmotion.y);
+
+                    if (hit >= 0 && hit != selected) {
+                        selected = hit;
+                        animate_to_target();
+                    }
+                    break;
+                }
+
+                case ButtonPress:
+                    if (e.xbutton.button == Button1) {
+                        int hit = hit_test(e.xbutton.x, e.xbutton.y);
+
+                        if (hit >= 0) {
+                            result = clients[hit].win;
+                            running = 0;
+                        }
+                    } else {
+                        running = 0;
+                    }
+                    break;
+
+                case KeyPress: {
+                    KeySym ks = XLookupKeysym(&e.xkey, 0);
+
+                    if (ks == XK_Escape) {
+                        running = 0;
+                    } else if (ks == XK_Tab || ks == XK_Right) {
+                        int fwd = !(e.xkey.state & ShiftMask);
+
+                        selected = fwd
+                        ? (selected + 1) % nclients
+                        : (selected - 1 + nclients) % nclients;
+
+                        animate_to_target();
+
+                    } else if (ks == XK_ISO_Left_Tab || ks == XK_Left) {
+                        selected = (selected - 1 + nclients) % nclients;
+                        animate_to_target();
+
+                    } else if (ks == XK_Return) {
+                        result = clients[selected].win;
+                        running = 0;
+                    }
+
+                    break;
+                }
+
+                case KeyRelease: {
+                    KeySym ks = XLookupKeysym(&e.xkey, 0);
+
+                    if (ks == XK_Super_L || ks == XK_Super_R) {
+                        result = clients[selected].win;
+                        running = 0;
+                    }
+
+                    break;
+                }
+            }
+
+            if (!running) break;
+        }
+
+        if (!running) break;
+
+        /* Koi naya X event nahi aaya - lekin video jaisi live content
+         * (mpv vo=gpu etc.) ke liye khud hi ~30fps pe pixmap refresh
+         * karke redraw karo, warna preview freeze dikhega. */
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(xfd, &fds);
+        struct timeval tv = { 0, 33000 }; /* ~30fps */
+
+        int ready = select(xfd + 1, &fds, NULL, NULL, &tv);
+        if (ready == 0) {
+            idle_frame++;
+            int side_tick = (idle_frame % 4 == 0);
+
+            refresh_wallpaper_picture();
+
+            for (int i = 0; i < nclients; i++) {
+                /* Selected/center window hamesha live refresh hoti hai
+                 * (yehi sabse zyada dekha jata hai). Side windows chhoti
+                 * aur dimmed hoti hain, unhe kam frequency pe refresh
+                 * karne se koi visible farq nahi padta - lekin round-trip
+                 * calls kaafi kam ho jati hain, jisse overall smoothness
+                 * behtar hoti hai. */
+                if (i == selected || side_tick) {
+                    refresh_client_picture(&clients[i]);
+                }
+            }
+            render_all();
+        }
+    }
+
+    XUngrabKeyboard(dpy, CurrentTime);
+    XUngrabPointer(dpy, CurrentTime);
+
+    destroy_overlay();
+    teardown_clients();
+
+    XFlush(dpy);
+
+    return result;
+}
+
+int main(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+    dpy = XOpenDisplay(NULL);
+    if (!dpy) {
+        fprintf(stderr, "overview: cannot open X display\n");
+        return 1;
+    }
+
+    XSetErrorHandler(x_error_handler);
+
+    scr  = DefaultScreen(dpy);
+    root = RootWindow(dpy, scr);
+    screen_w = DisplayWidth(dpy, scr);
+    screen_h = DisplayHeight(dpy, scr);
+
+    int ev, err;
+
+    if (!XCompositeQueryExtension(dpy, &ev, &err) ||
+        !XRenderQueryExtension(dpy, &ev, &err)) {
+        fprintf(stderr, "overview: XComposite/XRender extensions required\n");
+    XCloseDisplay(dpy);
+    return 1;
+        }
+
+        XCompositeRedirectSubwindows(dpy, root, CompositeRedirectAutomatic);
+
+        NET_CLIENT_LIST   = intern("_NET_CLIENT_LIST");
+        NET_ACTIVE_WINDOW = intern("_NET_ACTIVE_WINDOW");
+        XROOTPMAP_ID      = intern("_XROOTPMAP_ID");
+        ESETROOT_PMAP_ID  = intern("ESETROOT_PMAP_ID");
+
+        Window focused = get_currently_focused_window();
+
+        Window chosen = run_switcher(focused, 0);
+
+        if (chosen != None)
+            activate_window(chosen);
+
+    XCloseDisplay(dpy);
+    return 0;
+}

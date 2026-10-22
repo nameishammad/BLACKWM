@@ -1,0 +1,2289 @@
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+#include <X11/Xutil.h>
+#include <cairo/cairo.h>
+#include <cairo/cairo-xlib.h>
+#include <librsvg/rsvg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
+#include <glib.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <math.h>
+#include <time.h>
+
+/* ------------------------------------------------------------------ */
+/*  Panel look & layout                                                */
+/* ------------------------------------------------------------------ */
+#define PANEL_HEIGHT   46     // Plasma default is 44
+#define PANEL_MARGIN   8      // gap between panel and screen edges (0 = flush edge-to-edge)
+// #define PANEL_RADIUS   (PANEL_MARGIN > 0 ? 10 : 0)
+#define PANEL_RADIUS   (PANEL_MARGIN > 0 ? 5 : 0)
+
+#define EDGE_PAD       10     // left/right inner padding
+#define LAUNCHER_W     42     // application launcher button width
+#define SECTION_GAP    8      // keep task icons close to the Rofi launcher
+#define TASK_W         46     // task button width
+#define TASK_H         40     // task button height
+#define TASK_GAP       4
+#define ICON_SIZE      28
+#define BTN_RADIUS     6
+#define CLOCK_W        78
+#define CLOCK_FORMAT   "%I:%M %p"   // use "%I:%M %p" for 12-hour clock
+
+// ccmenu button (next to the clock)
+#define CCMENU_W        40
+#define CC_GAP          8
+#define PAGER_TILES     9        // number of fixed-size workspace buttons visible at once
+#define PAGER_TILE_W    26       // fixed width of each workspace button
+#define PAGER_W         (PAGER_TILE_W * PAGER_TILES)
+#define PAGER_GAP       8
+#define CCMENU_CMD      "/home/hammad/wm/bottom/cc/blackcc" // command (run through sh -c); put a full path/args here if needed
+#define CCMENU_BG_HEX   0x000000 // button background colour
+
+// Launcher icon: leave "" to auto-pick from the icon theme, or force a name
+// e.g. "rofi", "start-here-kde", "view-app-grid-symbolic"
+// #define LAUNCHER_ICON_NAME "/home/hammad/.local/share/icons/KDE-plasma/apps/scalable/applications-all.svg"
+// #define LAUNCHER_ICON_NAME "start-here-kde"
+#define LAUNCHER_ICON_NAME    "/home/hammad/.local/share/icons/Sours-Mono-Arrow/apps/scalable/start-here-arch.svg"
+// Force one icon theme (e.g. "Papirus-Dark"). "" = auto-detect: the most recently changed
+// setting among GTK / KDE / Qt (qt5ct, qt6ct) / xsettingsd / rofi / gsettings wins.
+// Can also be forced at run time:   DOCK_ICON_THEME=Papirus-Dark ./my_dock
+#define ICON_THEME_OVERRIDE   ""
+#define MAX_GROUPS 20
+#define MAX_WINDOWS_PER_GROUP 10
+
+#define TASKS_X (EDGE_PAD + LAUNCHER_W + SECTION_GAP)
+#define BTN_Y   ((PANEL_HEIGHT - TASK_H) / 2)
+
+// Popup (window list on hover)
+#define POPUP_W       230
+#define POPUP_ITEM_H  30
+#define POPUP_GAP     6
+
+// Breeze Dark palette
+#define SET_ACCENT(cr, a) cairo_set_source_rgba((cr), 0.239, 0.682, 0.914, (a))   // #3daee9
+#define SET_TEXT(cr, a)   cairo_set_source_rgba((cr), 0.937, 0.941, 0.945, (a))   // #eff0f1
+#define SET_HEX(cr, hex, a) cairo_set_source_rgba((cr), (((hex) >> 16) & 0xff) / 255.0, \
+                                                  (((hex) >> 8) & 0xff) / 255.0, \
+                                                  ((hex) & 0xff) / 255.0, (a))
+
+// hit-test results (>= 0 means task button index)
+#define HIT_NONE     -1
+#define HIT_LAUNCHER -2
+#define HIT_CCMENU   -3
+#define HIT_PAGER_BASE -100
+
+typedef struct {
+    char *class_name;
+    char *icon_path;
+    Window windows[MAX_WINDOWS_PER_GROUP];
+    int window_count;
+} AppGroup;
+
+// Global desktop cache
+static GHashTable *desktop_cache = NULL;
+// Cache of resolved icon paths per class_name
+static GHashTable *icon_resolve_cache = NULL;
+
+// Popup Window state
+static Window popup_win = None;
+static int hovered_group_idx = -1;      // group whose popup is open
+static int hover_item = HIT_NONE;       // item under the pointer (for highlight)
+static int current_window_cycle_index[MAX_GROUPS] = {0};
+static int popup_visible = 0;
+static int popup_geo_x = 0, popup_geo_y = 0, popup_geo_w = 0, popup_geo_h = 0;
+
+// Click bounce animation
+static int bouncing_group_idx = -1;
+static double bounce_progress = 0.0;
+static const double BOUNCE_DURATION = 0.35; // seconds
+static const double BOUNCE_HEIGHT = 4.0;    // pixels
+
+// Panel window
+static Window dock_win = None;
+static cairo_surface_t *dock_surface = NULL;
+static cairo_t *dock_cr = NULL;
+static int g_dock_x = 0, g_dock_y = 0, g_dock_w = 0;
+static int g_screen_width = 0, g_screen_height = 0, g_screen = 0;
+static Display *g_display = NULL;
+static XVisualInfo g_vinfo;
+
+static int desktop_count(void);
+
+// Windows can disappear between reading _NET_CLIENT_LIST and querying them.
+// Without this, Xlib's default handler exit()s the whole dock on BadWindow.
+static int x_error_handler(Display *d, XErrorEvent *e) {
+    if (e->error_code == BadWindow) return 0;   // dead window: harmless
+    char buf[128];
+    XGetErrorText(d, e->error_code, buf, sizeof buf);
+    fprintf(stderr, "my_dock: X error: %s (opcode %d)\n", buf, e->request_code);
+    return 0;
+}
+
+static int get_pager_width() {
+    int total = desktop_count();
+    int visible = (total < PAGER_TILES) ? total : PAGER_TILES;
+    return visible * PAGER_TILE_W;
+}
+
+void trigger_icon_bounce(int group_idx) {
+    bouncing_group_idx = group_idx;
+    bounce_progress = 0.0;
+}
+
+// Returns 1 if the point lies inside the popup (including the small gap above the panel,
+// so the pointer can travel from the panel up into the popup without closing it)
+int point_in_popup(int root_x, int root_y) {
+    if (!popup_visible) return 0;
+    return root_x >= popup_geo_x && root_x <= popup_geo_x + popup_geo_w &&
+           root_y >= popup_geo_y && root_y <= popup_geo_y + popup_geo_h + POPUP_GAP;
+}
+
+static int task_x(int idx) {
+    return TASKS_X + idx * (TASK_W + TASK_GAP);
+}
+
+static int ccmenu_x(int panel_w) {
+    // Menu button is to the RIGHT of the clock, as requested.
+    return panel_w - EDGE_PAD - CCMENU_W;
+}
+
+static int clock_x(int panel_w) {
+    return ccmenu_x(panel_w) - CC_GAP - CLOCK_W;
+}
+
+// static int pager_x(int panel_w) {
+//     return clock_x(panel_w) - PAGER_GAP - PAGER_W;
+// }
+static int pager_x(int panel_w) {
+    return clock_x(panel_w) - PAGER_GAP - get_pager_width();
+}
+
+static Atom net_current_desktop_atom = None;
+static Atom net_number_desktops_atom = None;
+static int pager_first = 0; // first workspace shown in the fixed-width pager
+
+static unsigned long root_cardinal(Display *display, Atom prop, unsigned long fallback) {
+    if (prop == None) return fallback;
+    Atom actual_type = None;
+    int actual_format = 0;
+    unsigned long nitems = 0, bytes_after = 0;
+    unsigned char *data = NULL;
+    unsigned long result = fallback;
+    if (XGetWindowProperty(display, DefaultRootWindow(display), prop, 0, 1, False,
+                           XA_CARDINAL, &actual_type, &actual_format, &nitems,
+                           &bytes_after, &data) == Success && data && nitems && actual_format == 32) {
+        result = *(unsigned long *)data;
+    }
+    if (data) XFree(data);
+    return result;
+}
+
+static int current_desktop(void) {
+    return (int)root_cardinal(g_display, net_current_desktop_atom, 0);
+}
+
+static int desktop_count(void) {
+    unsigned long n = root_cardinal(g_display, net_number_desktops_atom, PAGER_TILES);
+    if (n < 1) n = 1;
+    if (n > 32) n = 32;
+    return (int)n;
+}
+
+static void switch_desktop(int index) {
+    if (!g_display || net_current_desktop_atom == None) return;
+    XEvent e;
+    memset(&e, 0, sizeof(e));
+    e.xclient.type = ClientMessage;
+    e.xclient.window = DefaultRootWindow(g_display);
+    e.xclient.message_type = net_current_desktop_atom;
+    e.xclient.format = 32;
+    e.xclient.data.l[0] = index;
+    e.xclient.data.l[1] = CurrentTime;
+    XSendEvent(g_display, DefaultRootWindow(g_display), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &e);
+    XFlush(g_display);
+}
+
+// static int pager_hit_test(int x) {
+//     int px = pager_x(g_dock_w);
+//     if (x < px || x >= px + PAGER_W) return HIT_NONE;
+//
+//     int total = desktop_count();
+//     int slot = (x - px) / PAGER_TILE_W;
+//     if (slot < 0 || slot >= PAGER_TILES) return HIT_NONE;
+//     if (pager_first + slot >= total) return HIT_NONE;
+//     return HIT_PAGER_BASE - slot; // encode visible slot, not desktop index
+// }
+
+static int pager_hit_test(int x) {
+    int px = pager_x(g_dock_w);
+    if (x < px || x >= px + get_pager_width()) return HIT_NONE;
+
+    int total = desktop_count();
+    int slot = (x - px) / PAGER_TILE_W;
+    if (slot < 0 || slot >= PAGER_TILES) return HIT_NONE;
+    if (pager_first + slot >= total) return HIT_NONE;
+    return HIT_PAGER_BASE - slot; // encode visible slot, not desktop index
+}
+
+// Which item of the panel is at (x, y) in panel-local coordinates
+static int hit_test(int x, int y, int group_count) {
+    if (y < 0 || y >= PANEL_HEIGHT) return HIT_NONE;
+    if (x >= EDGE_PAD && x < EDGE_PAD + LAUNCHER_W) return HIT_LAUNCHER;
+    int ccx = ccmenu_x(g_dock_w);
+    if (x >= ccx && x < ccx + CCMENU_W) return HIT_CCMENU;
+    int phit = pager_hit_test(x);
+    if (phit != HIT_NONE) return phit;
+    if (x >= TASKS_X && x < pager_x(g_dock_w) - SECTION_GAP) {
+        int idx = (x - TASKS_X) / (TASK_W + TASK_GAP);
+        if (idx < group_count) return idx;
+    }
+    return HIT_NONE;
+}
+
+static void free_groups(AppGroup *groups, int count) {
+    if (!groups) return;
+    for (int i = 0; i < count; i++) {
+        free(groups[i].class_name);
+        free(groups[i].icon_path);
+    }
+    free(groups);
+}
+
+// Draws a rounded-rectangle path
+void rounded_rect_path(cairo_t *cr, double x, double y, double w, double h, double r) {
+    if (r > w / 2.0) r = w / 2.0;
+    if (r > h / 2.0) r = h / 2.0;
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, x + w - r, y + r, r, -M_PI / 2, 0);
+    cairo_arc(cr, x + w - r, y + h - r, r, 0, M_PI / 2);
+    cairo_arc(cr, x + r, y + h - r, r, M_PI / 2, M_PI);
+    cairo_arc(cr, x + r, y + r, r, M_PI, 3 * M_PI / 2);
+    cairo_close_path(cr);
+}
+
+void draw_app_grid_icon(cairo_t *cr, double x, double y, double size, double r, double g, double b, double a) {
+    int cols = 3, rows = 3;
+    double margin = size * 0.16;
+    double gap = size * 0.10;
+    double cell = (size - margin * 2 - gap * (cols - 1)) / cols;
+    double dot_r = cell / 2.0;
+
+    cairo_set_source_rgba(cr, r, g, b, a);
+    for (int row = 0; row < rows; row++) {
+        for (int col = 0; col < cols; col++) {
+            double cx = x + margin + dot_r + col * (cell + gap);
+            double cy = y + margin + dot_r + row * (cell + gap);
+            cairo_arc(cr, cx, cy, dot_r, 0, 2 * M_PI);
+            cairo_fill(cr);
+        }
+    }
+}
+
+void activate_window(Display *display, Window win) {
+    Atom net_active = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+    XEvent xev;
+    memset(&xev, 0, sizeof(xev));
+    xev.type = ClientMessage;
+    xev.xclient.window = win;
+    xev.xclient.message_type = net_active;
+    xev.xclient.format = 32;
+    xev.xclient.data.l[0] = 2;
+    xev.xclient.data.l[1] = CurrentTime;
+
+    XSendEvent(display, DefaultRootWindow(display), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &xev);
+    XRaiseWindow(display, win);
+    XSetInputFocus(display, win, RevertToParent, CurrentTime);
+
+    if (dock_win != None) {
+        XRaiseWindow(display, dock_win);
+    }
+
+    if (popup_visible && popup_win != None) {
+        XRaiseWindow(display, popup_win);
+    }
+
+    XFlush(display);
+}
+
+char* get_window_title(Display *display, Window win) {
+    Atom net_wm_name = XInternAtom(display, "_NET_WM_NAME", False);
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+
+    if (XGetWindowProperty(display, win, net_wm_name, 0, 1024, False,
+        XInternAtom(display, "UTF8_STRING", False),
+                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
+        char *title = strdup((char *)prop);
+    XFree(prop);
+    return title;
+                           }
+
+                           char *wm_name = NULL;
+                           if (XFetchName(display, win, &wm_name) && wm_name) {
+                               char *title = strdup(wm_name);
+                               XFree(wm_name);
+                               return title;
+                           }
+
+                           return strdup("Window");
+}
+
+char* get_window_class(Display *display, Window window) {
+    XClassHint *class_hint = XAllocClassHint();
+    char *class_name = NULL;
+
+    if (XGetClassHint(display, window, class_hint)) {
+        if (class_hint->res_class) {
+            class_name = strdup(class_hint->res_class);
+        }
+        if (class_hint->res_name)  XFree(class_hint->res_name);
+        if (class_hint->res_class) XFree(class_hint->res_class);
+    }
+    XFree(class_hint);
+    return class_name;
+}
+
+int file_exists(const char *path) {
+    return path && g_file_test(path, G_FILE_TEST_EXISTS);
+}
+
+static Window get_active_window(Display *display) {
+    Atom net_active = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+    Window active = None;
+
+    if (XGetWindowProperty(display, DefaultRootWindow(display), net_active, 0, 1, False,
+                           XA_WINDOW, &actual_type, &actual_format, &nitems, &bytes_after,
+                           &prop) == Success && prop) {
+        if (nitems == 1 && actual_format == 32) active = *(Window *)prop;
+        XFree(prop);
+    }
+    return active;
+}
+
+static int group_has_window(const AppGroup *g, Window w) {
+    if (w == None) return 0;
+    for (int i = 0; i < g->window_count; i++) {
+        if (g->windows[i] == w) return 1;
+    }
+    return 0;
+}
+
+// center_x / panel_y are absolute (root) coordinates of the hovered task button / panel top
+void show_popup(Display *display, int screen, int center_x, int panel_y, AppGroup *group) {
+    if (!group || group->window_count == 0) return;
+
+    int popup_width = POPUP_W;
+    int item_height = POPUP_ITEM_H;
+    int row_gap = 3;
+    int popup_height = group->window_count * item_height + 10;
+
+    int popup_x = center_x - popup_width / 2;
+    int popup_y = panel_y - popup_height - POPUP_GAP;
+
+    if (popup_x < 4) popup_x = 4;
+    if (popup_x + popup_width > g_screen_width) popup_x = g_screen_width - popup_width - 4;
+
+    popup_geo_x = popup_x;
+    popup_geo_y = popup_y;
+    popup_geo_w = popup_width;
+    popup_geo_h = popup_height;
+    popup_visible = 1;
+
+    if (!popup_win) {
+        XSetWindowAttributes attrs;
+        attrs.override_redirect = True;
+        attrs.background_pixel = 0;
+        attrs.border_pixel = 0;
+        attrs.colormap = XCreateColormap(display, DefaultRootWindow(display), g_vinfo.visual, AllocNone);
+
+        popup_win = XCreateWindow(
+            display, DefaultRootWindow(display),
+            popup_x, popup_y, popup_width, popup_height, 0,
+            g_vinfo.depth, InputOutput, g_vinfo.visual,
+            CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWColormap, &attrs
+        );
+
+        Atom wm_type = XInternAtom(display, "_NET_WM_WINDOW_TYPE", False);
+        Atom wm_tooltip = XInternAtom(display, "_NET_WM_WINDOW_TYPE_TOOLTIP", False);
+        XChangeProperty(display, popup_win, wm_type, XA_ATOM, 32,
+                        PropModeReplace, (unsigned char *)&wm_tooltip, 1);
+
+        Atom net_wm_state = XInternAtom(display, "_NET_WM_STATE", False);
+        Atom state_above = XInternAtom(display, "_NET_WM_STATE_ABOVE", False);
+        XChangeProperty(display, popup_win, net_wm_state, XA_ATOM, 32,
+                        PropModeReplace, (unsigned char *)&state_above, 1);
+
+        XSelectInput(display, popup_win, ExposureMask | ButtonPressMask | LeaveWindowMask);
+    } else {
+        XMoveResizeWindow(display, popup_win, popup_x, popup_y, popup_width, popup_height);
+    }
+
+    XMapRaised(display, popup_win);
+    XRaiseWindow(display, popup_win);
+
+    cairo_surface_t *surface = cairo_xlib_surface_create(
+        display, popup_win, g_vinfo.visual, popup_width, popup_height
+    );
+    cairo_t *cr = cairo_create(surface);
+
+    cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+
+    // Plasma tooltip style frame
+    rounded_rect_path(cr, 0.5, 0.5, popup_width - 1, popup_height - 1, 10);
+    cairo_pattern_t *bg = cairo_pattern_create_linear(0, 0, 0, popup_height);
+    cairo_pattern_add_color_stop_rgba(bg, 0.0, 0.165, 0.180, 0.196, 0.98);
+    cairo_pattern_add_color_stop_rgba(bg, 1.0, 0.130, 0.141, 0.153, 0.98);
+    cairo_set_source(cr, bg);
+    cairo_fill_preserve(cr);
+    cairo_pattern_destroy(bg);
+    SET_TEXT(cr, 0.12);
+    cairo_set_line_width(cr, 1.0);
+    cairo_stroke(cr);
+
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 12);
+
+    Window active = get_active_window(display);
+
+    for (int i = 0; i < group->window_count; i++) {
+        char *raw = get_window_title(display, group->windows[i]);
+        char *title = g_utf8_make_valid(raw, -1);
+        free(raw);
+
+        // UTF-8 safe truncation
+        if (g_utf8_strlen(title, -1) > 26) {
+            char *end = g_utf8_offset_to_pointer(title, 25);
+            char *cut = g_strdup_printf("%.*s…", (int)(end - title), title);
+            g_free(title);
+            title = cut;
+        }
+
+        int is_active = (group->windows[i] == active);
+        double row_y = 5 + (i * item_height);
+        double row_h = item_height - row_gap;
+
+        rounded_rect_path(cr, 5, row_y, popup_width - 10, row_h, BTN_RADIUS);
+        if (is_active) SET_ACCENT(cr, 0.22); else SET_TEXT(cr, 0.05);
+        cairo_fill(cr);
+
+        if (is_active) SET_ACCENT(cr, 1.0); else SET_TEXT(cr, 0.35);
+        cairo_arc(cr, 17, row_y + row_h / 2.0, 2.8, 0, 2 * M_PI);
+        cairo_fill(cr);
+
+        SET_TEXT(cr, is_active ? 1.0 : 0.88);
+        cairo_move_to(cr, 28, row_y + row_h / 2.0 + 4);
+        cairo_show_text(cr, title);
+        g_free(title);
+    }
+
+    cairo_destroy(cr);
+    cairo_surface_destroy(surface);
+
+    XRaiseWindow(display, popup_win);
+    XFlush(display);
+}
+
+void hide_popup(Display *display) {
+    if (popup_win) {
+        XUnmapWindow(display, popup_win);
+    }
+    hovered_group_idx = -1;
+    popup_visible = 0;
+}
+
+
+/* ------------------------------------------------------------------ */
+/*  Icon theme lookup (follows rofi / GTK / KDE icon theme)            */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    char *subdir;
+    int size, min, max, scale;
+    int scalable;
+} ThemeDir;
+
+typedef struct {
+    char *path;          // <base>/<theme>
+    GPtrArray *dirs;     // ThemeDir*
+} ThemeInstance;
+
+typedef struct {
+    GPtrArray *instances; // one per icon base dir that contains this theme
+    char **inherits;
+} ThemeInfo;
+
+static GHashTable *theme_cache = NULL;
+static char *current_theme_name = NULL;
+static guint64 theme_last_sig = 0;
+
+// launcher icon cache (reset when the icon theme changes)
+static char *g_launcher_icon_path = NULL;
+static int   g_launcher_icon_resolved = 0;
+
+// "/a/b/foo.svg" -> "foo", "foo.png" -> "foo", "org.kde.app" stays as is
+static char *icon_stem(const char *s) {
+    char *base = g_path_get_basename(s);
+    static const char *exts[] = { ".svg", ".svgz", ".png", ".xpm" };
+    for (size_t i = 0; i < G_N_ELEMENTS(exts); i++) {
+        size_t bl = strlen(base), el = strlen(exts[i]);
+        if (bl > el && g_str_has_suffix(base, exts[i])) { base[bl - el] = '\0'; break; }
+    }
+    return base;
+}
+
+static GPtrArray *get_theme_bases(void) {
+    static GPtrArray *bases = NULL;
+    if (bases) return bases;
+    bases = g_ptr_array_new();
+    g_ptr_array_add(bases, g_build_filename(g_get_home_dir(), ".icons", NULL));
+    g_ptr_array_add(bases, g_build_filename(g_get_user_data_dir(), "icons", NULL));
+    const char * const *sys = g_get_system_data_dirs();
+    for (; sys && *sys; sys++) {
+        g_ptr_array_add(bases, g_build_filename(*sys, "icons", NULL));
+    }
+    return bases;
+}
+
+// Themes without a usable index.theme (hand-made / minimal icon packs such as
+// <theme>/apps/scalable/foo.svg): walk the folders and guess the sizes.
+static void scan_theme_tree(ThemeInstance *inst, const char *rel, int depth) {
+    char *full = rel[0] ? g_build_filename(inst->path, rel, NULL) : g_strdup(inst->path);
+    DIR *dir = opendir(full);
+    g_free(full);
+    if (!dir) return;
+
+    int has_icons = 0;
+    GPtrArray *subs = g_ptr_array_new_with_free_func(g_free);
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        char *p = rel[0] ? g_build_filename(inst->path, rel, ent->d_name, NULL)
+                         : g_build_filename(inst->path, ent->d_name, NULL);
+        if (g_file_test(p, G_FILE_TEST_IS_DIR)) g_ptr_array_add(subs, g_strdup(ent->d_name));
+        else if (g_str_has_suffix(ent->d_name, ".svg") || g_str_has_suffix(ent->d_name, ".png")) has_icons = 1;
+        g_free(p);
+    }
+    closedir(dir);
+
+    if (has_icons && rel[0]) {
+        ThemeDir *d = g_new0(ThemeDir, 1);
+        d->subdir = g_strdup(rel);
+        d->scale = 1;
+        if (strstr(rel, "scalable")) {
+            d->scalable = 1;
+            d->size = ICON_SIZE;
+            d->min = 1;
+            d->max = 512;
+        } else {
+            int size = 0;
+            for (const char *c = rel; *c; c++) {
+                if (isdigit((unsigned char)*c)) { size = atoi(c); break; }
+            }
+            if (size <= 0) size = 48;
+            d->size = d->min = d->max = size;
+        }
+        g_ptr_array_add(inst->dirs, d);
+    }
+
+    if (depth < 4) {
+        for (guint i = 0; i < subs->len; i++) {
+            const char *sub = g_ptr_array_index(subs, i);
+            char *child = rel[0] ? g_build_filename(rel, sub, NULL) : g_strdup(sub);
+            scan_theme_tree(inst, child, depth + 1);
+            g_free(child);
+        }
+    }
+    g_ptr_array_free(subs, TRUE);
+}
+
+static ThemeInfo *load_theme(const char *name) {
+    if (!theme_cache) theme_cache = g_hash_table_new(g_str_hash, g_str_equal);
+
+    ThemeInfo *info = g_hash_table_lookup(theme_cache, name);
+    if (info) return info;
+
+    info = g_new0(ThemeInfo, 1);
+    info->instances = g_ptr_array_new();
+    GPtrArray *bases = get_theme_bases();
+
+    for (guint b = 0; b < bases->len; b++) {
+        char *theme_path = g_build_filename(g_ptr_array_index(bases, b), name, NULL);
+        if (!g_file_test(theme_path, G_FILE_TEST_IS_DIR)) {
+            g_free(theme_path);
+            continue;
+        }
+
+        char *index_path = g_build_filename(theme_path, "index.theme", NULL);
+        GKeyFile *kf = g_key_file_new();
+        int have_index = g_key_file_load_from_file(kf, index_path, G_KEY_FILE_NONE, NULL);
+
+        if (have_index && !info->inherits) {
+            info->inherits = g_key_file_get_string_list(kf, "Icon Theme", "Inherits", NULL, NULL);
+        }
+
+        ThemeInstance *inst = g_new0(ThemeInstance, 1);
+        inst->path = theme_path;
+        inst->dirs = g_ptr_array_new();
+
+        const char *keys[] = { "Directories", "ScaledDirectories" };
+        for (int k = 0; have_index && k < 2; k++) {
+            gsize n = 0;
+            char **list = g_key_file_get_string_list(kf, "Icon Theme", keys[k], &n, NULL);
+            for (gsize i = 0; list && i < n; i++) {
+                if (!g_key_file_has_group(kf, list[i])) continue;
+
+                int size = g_key_file_get_integer(kf, list[i], "Size", NULL);
+                if (size <= 0) continue;
+
+                ThemeDir *d = g_new0(ThemeDir, 1);
+                d->subdir = g_strdup(list[i]);
+                d->size = size;
+
+                d->scale = g_key_file_get_integer(kf, list[i], "Scale", NULL);
+                if (d->scale < 1) d->scale = 1;
+
+                char *type = g_key_file_get_string(kf, list[i], "Type", NULL);
+                d->scalable = (type && g_ascii_strcasecmp(type, "Scalable") == 0);
+                g_free(type);
+
+                GError *err = NULL;
+                d->min = g_key_file_get_integer(kf, list[i], "MinSize", &err);
+                if (err) { g_clear_error(&err); d->min = size; }
+                d->max = g_key_file_get_integer(kf, list[i], "MaxSize", &err);
+                if (err) { g_clear_error(&err); d->max = size; }
+
+                g_ptr_array_add(inst->dirs, d);
+            }
+            g_strfreev(list);
+        }
+
+        // no index.theme (or it lists nothing usable): guess the layout from the folders
+        if (inst->dirs->len == 0) scan_theme_tree(inst, "", 0);
+
+        g_ptr_array_add(info->instances, inst);
+        g_free(index_path);
+        g_key_file_free(kf);
+    }
+
+    g_hash_table_insert(theme_cache, g_strdup(name), info);
+    return info;
+}
+
+static int theme_exists(const char *name) {
+    return name && name[0] && load_theme(name)->instances->len > 0;
+}
+
+static int theme_dir_distance(const ThemeDir *d, int target) {
+    if (d->scalable) {
+        int mn = d->min * d->scale, mx = d->max * d->scale;
+        if (target < mn) return mn - target;
+        if (target > mx) return target - mx;
+        return 0;
+    }
+    int size = d->size * d->scale;
+    int dist = abs(size - target);
+    if (size < target) dist += 2;   // prefer downscaling over upscaling
+    return dist;
+}
+
+static char *search_theme_instance(const ThemeInstance *inst, const char *icon, int target) {
+    static const char *exts[] = { ".svg", ".png" };
+    int best_score = G_MAXINT;
+    char *best = NULL;
+
+    for (guint i = 0; i < inst->dirs->len; i++) {
+        const ThemeDir *d = g_ptr_array_index(inst->dirs, i);
+        int score = theme_dir_distance(d, target) * 2 + (d->scalable ? 0 : 1);
+        if (score >= best_score) continue;
+
+        for (int e = 0; e < 2; e++) {
+            char *p = g_strdup_printf("%s/%s/%s%s", inst->path, d->subdir, icon, exts[e]);
+            if (g_file_test(p, G_FILE_TEST_IS_REGULAR)) {
+                g_free(best);
+                best = p;
+                best_score = score;
+                break;
+            }
+            g_free(p);
+        }
+    }
+    return best;
+}
+
+static char *find_in_theme(const char *theme, const char *icon, int target, int depth) {
+    if (depth > 5 || !theme_exists(theme)) return NULL;
+    ThemeInfo *info = load_theme(theme);
+
+    for (guint i = 0; i < info->instances->len; i++) {
+        char *r = search_theme_instance(g_ptr_array_index(info->instances, i), icon, target);
+        if (r) return r;
+    }
+    for (int i = 0; info->inherits && info->inherits[i]; i++) {
+        if (strcmp(info->inherits[i], theme) == 0) continue;
+        char *r = find_in_theme(info->inherits[i], icon, target, depth + 1);
+        if (r) return r;
+    }
+    return NULL;
+}
+
+// --- which theme is the user using? -------------------------------------
+
+static char *strip_quotes(const char *s) {
+    char *t = g_strdup(s);
+    g_strstrip(t);
+    size_t len = strlen(t);
+    while (len > 0 && (t[len - 1] == '"' || t[len - 1] == '\'' || t[len - 1] == ';')) t[--len] = '\0';
+    char *start = t;
+    while (*start == '"' || *start == '\'') start++;
+    char *out = g_strdup(start);
+    g_free(t);
+    return out;
+}
+
+// rofi's own icon-theme option (only listed uncommented in -dump-config when it is set)
+static char *theme_from_rofi(void) {
+    char *rofi = g_find_program_in_path("rofi");
+    if (!rofi) return NULL;
+    g_free(rofi);
+
+    FILE *fp = popen("rofi -dump-config 2>/dev/null", "r");
+    if (!fp) return NULL;
+
+    char line[512];
+    char *result = NULL;
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "icon-theme:", 11) != 0) continue;   // commented-out lines start with "/*"
+        result = strip_quotes(p + 11);
+        break;
+    }
+    pclose(fp);
+    if (result && !result[0]) { g_free(result); result = NULL; }
+    return result;
+}
+
+static char *theme_from_keyfile(const char *path, const char *group, const char *key) {
+    GKeyFile *kf = g_key_file_new();
+    char *val = NULL;
+    if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
+        val = g_key_file_get_string(kf, group, key, NULL);
+    }
+    g_key_file_free(kf);
+    if (val) {
+        char *clean = strip_quotes(val);
+        g_free(val);
+        val = clean;
+    }
+    return val;
+}
+
+static char *theme_from_gtkrc2(void) {
+    char *path = g_build_filename(g_get_home_dir(), ".gtkrc-2.0", NULL);
+    FILE *fp = fopen(path, "r");
+    g_free(path);
+    if (!fp) return NULL;
+
+    char line[512];
+    char *result = NULL;
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = strstr(line, "gtk-icon-theme-name");
+        if (!p) continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        result = strip_quotes(eq + 1);
+        break;
+    }
+    fclose(fp);
+    return result;
+}
+
+static char *theme_from_gsettings(void) {
+    FILE *fp = popen("gsettings get org.gnome.desktop.interface icon-theme 2>/dev/null", "r");
+    if (!fp) return NULL;
+    char line[256];
+    char *result = NULL;
+    if (fgets(line, sizeof(line), fp)) result = strip_quotes(line);
+    pclose(fp);
+    return result;
+}
+
+static char *theme_from_xsettingsd(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return NULL;
+    char line[512];
+    char *result = NULL;
+    while (fgets(line, sizeof(line), fp)) {
+        const char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '#') continue;
+        char *p = strstr(line, "Net/IconThemeName");
+        if (!p) continue;
+        result = strip_quotes(p + strlen("Net/IconThemeName"));
+        break;
+    }
+    fclose(fp);
+    return result;
+}
+
+// Files that can carry the icon-theme setting. Index == index into the values in detect_icon_theme().
+#define THEME_SRC_COUNT 9
+static GPtrArray *theme_watch_files(void) {
+    static GPtrArray *w = NULL;
+    if (w) return w;
+    w = g_ptr_array_new();
+    const char *cfg  = g_get_user_config_dir();
+    const char *home = g_get_home_dir();
+    g_ptr_array_add(w, g_build_filename(cfg, "gtk-3.0", "settings.ini", NULL));        // 0 gtk3
+    g_ptr_array_add(w, g_build_filename(cfg, "gtk-4.0", "settings.ini", NULL));        // 1 gtk4
+    g_ptr_array_add(w, g_build_filename(cfg, "kdeglobals", NULL));                     // 2 KDE
+    g_ptr_array_add(w, g_build_filename(cfg, "qt5ct", "qt5ct.conf", NULL));            // 3 qt5ct
+    g_ptr_array_add(w, g_build_filename(cfg, "qt6ct", "qt6ct.conf", NULL));            // 4 qt6ct
+    g_ptr_array_add(w, g_build_filename(home, ".gtkrc-2.0", NULL));                    // 5 gtk2
+    g_ptr_array_add(w, g_build_filename(cfg, "xsettingsd", "xsettingsd.conf", NULL));  // 6 xsettingsd
+    g_ptr_array_add(w, g_build_filename(cfg, "rofi", "config.rasi", NULL));            // 7 rofi
+    g_ptr_array_add(w, g_build_filename(cfg, "dconf", "user", NULL));                  // 8 gsettings/dconf
+    return w;
+}
+
+static time_t file_mtime(const char *path) {
+    struct stat st;
+    return (path && stat(path, &st) == 0) ? st.st_mtime : 0;
+}
+
+static guint64 theme_watch_signature(void) {
+    GPtrArray *w = theme_watch_files();
+    guint64 sig = 0;
+    for (guint i = 0; i < w->len; i++)
+        sig += (guint64)file_mtime(g_ptr_array_index(w, i)) * (i + 1);
+    return sig;
+}
+
+// Pick the icon theme the user applied: whichever settings source changed most recently
+// (and names a theme that is really installed). Always returns a newly allocated name.
+static char *detect_icon_theme(void) {
+    const char *forced = ICON_THEME_OVERRIDE;
+    if (!forced[0]) forced = g_getenv("DOCK_ICON_THEME");
+    if (forced && forced[0]) {
+        if (theme_exists(forced)) return g_strdup(forced);
+        fprintf(stderr, "my_dock: forced icon theme '%s' not found, auto-detecting\n", forced);
+    }
+
+    GPtrArray *w = theme_watch_files();
+    char *val[THEME_SRC_COUNT] = { NULL };
+    val[0] = theme_from_keyfile(g_ptr_array_index(w, 0), "Settings", "gtk-icon-theme-name");
+    val[1] = theme_from_keyfile(g_ptr_array_index(w, 1), "Settings", "gtk-icon-theme-name");
+    val[2] = theme_from_keyfile(g_ptr_array_index(w, 2), "Icons", "Theme");
+    val[3] = theme_from_keyfile(g_ptr_array_index(w, 3), "Appearance", "icon_theme");
+    val[4] = theme_from_keyfile(g_ptr_array_index(w, 4), "Appearance", "icon_theme");
+    val[5] = theme_from_gtkrc2();
+    val[6] = theme_from_xsettingsd(g_ptr_array_index(w, 6));
+    val[7] = theme_from_rofi();
+    val[8] = theme_from_gsettings();
+
+    int best = -1;
+    time_t best_t = -1;
+    for (int i = 0; i < THEME_SRC_COUNT; i++) {
+        int ok = val[i] && val[i][0] && theme_exists(val[i]);
+        time_t t = file_mtime(g_ptr_array_index(w, i));
+        fprintf(stderr, "my_dock:   theme source %d: %-20s %s (mtime %ld)\n", i,
+                val[i] && val[i][0] ? val[i] : "-", ok ? "ok" : (val[i] && val[i][0] ? "NOT INSTALLED" : ""), (long)t);
+        if (ok && t > best_t) { best = i; best_t = t; }
+    }
+
+    char *result = (best >= 0) ? g_strdup(val[best]) : g_strdup("hicolor");
+    for (int i = 0; i < THEME_SRC_COUNT; i++) g_free(val[i]);
+    return result;
+}
+
+static const char *get_current_theme(void) {
+    if (current_theme_name) return current_theme_name;
+    theme_last_sig = theme_watch_signature();
+    current_theme_name = detect_icon_theme();
+    fprintf(stderr, "my_dock: icon theme = %s\n", current_theme_name);
+    return current_theme_name;
+}
+
+// Cheap (a few stat() calls). Returns 1 when the user switched icon theme since the last
+// call; all icon caches are already dropped then, so the caller only has to redraw.
+int icon_theme_check_changed(void) {
+    if (!current_theme_name) return 0;
+    guint64 sig = theme_watch_signature();
+    if (sig == theme_last_sig) return 0;
+    theme_last_sig = sig;
+
+    if (theme_cache) g_hash_table_remove_all(theme_cache);   // re-read index.theme files (tiny leak, rare)
+    char *fresh = detect_icon_theme();
+    if (strcmp(fresh, current_theme_name) == 0) {
+        g_free(fresh);
+        return 0;
+    }
+
+    fprintf(stderr, "my_dock: icon theme changed: %s -> %s\n", current_theme_name, fresh);
+    g_free(current_theme_name);
+    current_theme_name = fresh;
+
+    if (icon_resolve_cache) g_hash_table_remove_all(icon_resolve_cache);
+    g_free(g_launcher_icon_path);
+    g_launcher_icon_path = NULL;
+    g_launcher_icon_resolved = 0;
+    return 1;
+}
+
+// Current theme + the themes it inherits from. No hicolor, no other themes.
+char *find_icon_in_theme_only(const char *icon_name, int size) {
+    if (!icon_name || !icon_name[0]) return NULL;
+    return find_in_theme(get_current_theme(), icon_name, size, 0);
+}
+
+// Look an icon up in the current theme (+ inherited themes + hicolor)
+char *find_icon_in_current_theme(const char *icon_name, int size) {
+    if (!icon_name || !icon_name[0]) return NULL;
+    const char *theme = get_current_theme();
+
+    char *r = find_icon_in_theme_only(icon_name, size);
+    if (!r && strcmp(theme, "hicolor") != 0) r = find_in_theme("hicolor", icon_name, size, 0);
+    return r;
+}
+
+char* find_icon_recursive(const char *root_dir, const char *icon_name, int depth) {
+    if (!root_dir || depth > 6) return NULL;
+
+    DIR *dir = opendir(root_dir);
+    if (!dir) return NULL;
+
+    struct dirent *entry;
+    char *result = NULL;
+    char *subdirs[256];
+    int subdir_count = 0;
+
+    const char *extensions[] = {".svg", ".png", ".xpm"};
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+
+        char *full_path = g_build_filename(root_dir, entry->d_name, NULL);
+        struct stat st;
+        if (stat(full_path, &st) != 0) {
+            g_free(full_path);
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            if (subdir_count < 256) {
+                subdirs[subdir_count++] = full_path;
+            } else {
+                g_free(full_path);
+            }
+            continue;
+        }
+
+        for (size_t e = 0; e < sizeof(extensions)/sizeof(extensions[0]); e++) {
+            char *target = g_strdup_printf("%s%s", icon_name, extensions[e]);
+            if (strcmp(entry->d_name, target) == 0) {
+                g_free(target);
+                result = full_path;
+                break;
+            }
+            g_free(target);
+        }
+
+        if (result) break;
+        g_free(full_path);
+    }
+    closedir(dir);
+
+    if (!result) {
+        for (int i = 0; i < subdir_count; i++) {
+            if (!result) {
+                result = find_icon_recursive(subdirs[i], icon_name, depth + 1);
+            }
+            g_free(subdirs[i]);
+        }
+    } else {
+        for (int i = 0; i < subdir_count; i++) g_free(subdirs[i]);
+    }
+
+    return result;
+}
+
+static char* find_icon_in_system_impl(const char *icon_name);
+
+char* find_icon_in_system(const char *icon_name) {
+    if (!icon_name) return NULL;
+    char *r = find_icon_in_system_impl(icon_name);
+    if (r) return r;
+
+    // "Icon=foo.png" / absolute path that no longer exists: retry by plain name
+    char *stem = icon_stem(icon_name);
+    if (strcmp(stem, icon_name) != 0) r = find_icon_in_system_impl(stem);
+    g_free(stem);
+    return r;
+}
+
+static char* find_icon_in_system_impl(const char *icon_name) {
+    if (!icon_name) return NULL;
+
+    if (icon_name[0] == '/' && file_exists(icon_name)) {
+        return strdup(icon_name);
+    }
+
+    if (strstr(icon_name, ".")) {
+        if (file_exists(icon_name)) {
+            return strdup(icon_name);
+        }
+    }
+
+    // Follow the current icon theme first (rofi icon-theme / GTK / KDE)
+    {
+        char *themed = find_icon_in_current_theme(icon_name, ICON_SIZE);
+        if (themed) return themed;
+    }
+
+    const char *extensions[] = {".svg", ".png", ".xpm", ""};
+
+    const char *dirs[] = {
+        "/usr/local/share/icons/hicolor/scalable/apps",
+        "/usr/local/share/icons/hicolor/48x48/apps",
+        "/usr/local/share/icons/hicolor/256x256/apps",
+        "/usr/local/share/icons/hicolor/128x128/apps",
+        "/usr/local/share/icons/hicolor/64x64/apps",
+        "/usr/local/share/icons/hicolor/32x32/apps",
+        "/usr/local/share/icons/hicolor/24x24/apps",
+        "/usr/local/share/icons/hicolor/22x22/apps",
+        "/usr/local/share/icons/hicolor/16x16/apps",
+        "/usr/local/share/icons",
+        "/usr/local/share/pixmaps",
+        "/usr/local/pixmaps",
+        "/usr/local/icons",
+        "/usr/share/icons/hicolor/scalable/apps",
+        "/usr/share/icons/hicolor/48x48/apps",
+        "/usr/share/icons/hicolor/256x256/apps",
+        "/usr/share/icons/hicolor/128x128/apps",
+        "/usr/share/icons/hicolor/64x64/apps",
+        "/usr/share/icons/hicolor/32x32/apps",
+        "/usr/share/icons/hicolor/24x24/apps",
+        "/usr/share/icons/hicolor/22x22/apps",
+        "/usr/share/icons/hicolor/16x16/apps",
+        "/usr/share/icons/Adwaita/scalable/apps",
+        "/usr/share/icons/Papirus/scalable/apps",
+        "/usr/share/pixmaps",
+        "/usr/share/icons",
+        "/opt/icons",
+        "/opt/share/icons",
+        "/opt/share/pixmaps",
+        "/opt/share/apps/icons"
+    };
+
+    char *local_icon_dir = g_build_filename(g_get_home_dir(), ".local/share/icons", NULL);
+    char *local_apps_dir = g_build_filename(g_get_home_dir(), ".local/share/applications", NULL);
+    char *local_pixmaps = g_build_filename(g_get_home_dir(), ".local/share/pixmaps", NULL);
+    char *local_icons = g_build_filename(g_get_home_dir(), ".icons", NULL);
+
+    const char *user_dirs[] = {
+        local_icon_dir,
+        local_apps_dir,
+        local_pixmaps,
+        local_icons,
+        NULL
+    };
+
+    for (size_t d = 0; user_dirs[d]; d++) {
+        for (size_t e = 0; e < sizeof(extensions)/sizeof(extensions[0]); e++) {
+            char *full_path = g_strdup_printf("%s/%s%s", user_dirs[d], icon_name, extensions[e]);
+            if (file_exists(full_path)) {
+                g_free(local_icon_dir);
+                g_free(local_apps_dir);
+                g_free(local_pixmaps);
+                g_free(local_icons);
+                return full_path;
+            }
+            g_free(full_path);
+        }
+    }
+
+    g_free(local_icon_dir);
+    g_free(local_apps_dir);
+    g_free(local_pixmaps);
+    g_free(local_icons);
+
+    for (size_t d = 0; d < sizeof(dirs)/sizeof(dirs[0]); d++) {
+        for (size_t e = 0; e < sizeof(extensions)/sizeof(extensions[0]); e++) {
+            char *full_path = g_strdup_printf("%s/%s%s", dirs[d], icon_name, extensions[e]);
+            if (file_exists(full_path)) {
+                return full_path;
+            }
+            g_free(full_path);
+        }
+    }
+
+    const char *recursive_roots[] = {
+        "/usr/share/icons",
+        "/usr/local/share/icons",
+        "/usr/share/pixmaps",
+        "/usr/local/share/pixmaps",
+        "/opt/icons",
+        "/opt/share/icons"
+    };
+    char *user_icons_1 = g_build_filename(g_get_home_dir(), ".local/share/icons", NULL);
+    char *user_icons_2 = g_build_filename(g_get_home_dir(), ".icons", NULL);
+
+    char *found = NULL;
+    for (size_t d = 0; d < sizeof(recursive_roots)/sizeof(recursive_roots[0]); d++) {
+        found = find_icon_recursive(recursive_roots[d], icon_name, 0);
+        if (found) break;
+    }
+    if (!found) found = find_icon_recursive(user_icons_1, icon_name, 0);
+    if (!found) found = find_icon_recursive(user_icons_2, icon_name, 0);
+
+    g_free(user_icons_1);
+    g_free(user_icons_2);
+    if (found) return found;
+
+    return NULL;
+}
+
+void scan_desktop_directory(const char *dir_path, GHashTable *cache) {
+    if (!dir_path) return;
+
+    DIR *dir = opendir(dir_path);
+    if (!dir) return;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        char *filename = entry->d_name;
+        if (!g_str_has_suffix(filename, ".desktop")) continue;
+
+        char *full_path = g_build_filename(dir_path, filename, NULL);
+        GKeyFile *key_file = g_key_file_new();
+
+        if (g_key_file_load_from_file(key_file, full_path, G_KEY_FILE_NONE, NULL)) {
+            char *exec = g_key_file_get_string(key_file, "Desktop Entry", "Exec", NULL);
+            char *icon = g_key_file_get_string(key_file, "Desktop Entry", "Icon", NULL);
+            char *name = g_key_file_get_string(key_file, "Desktop Entry", "Name", NULL);
+            char *wm_class = g_key_file_get_string(key_file, "Desktop Entry", "StartupWMClass", NULL);
+
+            if (wm_class && icon) {
+                g_hash_table_insert(cache, g_strdup(wm_class), g_strdup(icon));
+                char *wm_class_lower = g_utf8_strdown(wm_class, -1);
+                g_hash_table_insert(cache, wm_class_lower, g_strdup(icon));
+            }
+            g_free(wm_class);
+
+            if (exec && icon) {
+                char *exec_first = strdup(exec);
+                char *space = strchr(exec_first, ' ');
+                if (space) *space = '\0';
+
+                char *basename = g_path_get_basename(filename);
+                char *dot = strrchr(basename, '.');
+                if (dot) *dot = '\0';
+
+                g_hash_table_insert(cache, g_strdup(exec_first), g_strdup(icon));
+                g_hash_table_insert(cache, g_strdup(basename), g_strdup(icon));
+
+                char *exec_lower = g_utf8_strdown(exec_first, -1);
+                g_hash_table_insert(cache, exec_lower, g_strdup(icon));
+
+                char *base_lower = g_utf8_strdown(basename, -1);
+                g_hash_table_insert(cache, base_lower, g_strdup(icon));
+
+                if (name) {
+                    char *name_lower = g_utf8_strdown(name, -1);
+                    g_hash_table_insert(cache, name_lower, g_strdup(icon));
+                    g_hash_table_insert(cache, g_strdup(name), g_strdup(icon));
+                    g_free(name);
+                }
+
+                g_free(exec_first);
+                g_free(basename);
+            }
+
+            g_free(exec);
+            g_free(icon);
+            g_key_file_free(key_file);
+        }
+        g_free(full_path);
+    }
+    closedir(dir);
+}
+
+void build_desktop_cache() {
+    if (desktop_cache) {
+        g_hash_table_destroy(desktop_cache);
+    }
+
+    desktop_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+
+    char *local_desktop_dir = g_build_filename(g_get_home_dir(), ".local/share/applications", NULL);
+    scan_desktop_directory(local_desktop_dir, desktop_cache);
+    g_free(local_desktop_dir);
+
+    const char *desktop_dirs[] = {
+        "/usr/share/applications",
+        "/usr/local/share/applications",
+        "/usr/local/applications",
+        "/opt/share/applications",
+        "/opt/applications",
+        "/usr/share/apps",
+        "/usr/local/share/apps",
+        "/var/lib/snapd/desktop/applications",
+        NULL
+    };
+
+    for (size_t i = 0; desktop_dirs[i]; i++) {
+        scan_desktop_directory(desktop_dirs[i], desktop_cache);
+    }
+}
+
+char* get_icon_from_desktop(const char *class_name) {
+    if (!class_name || !desktop_cache) return NULL;
+
+    char *icon = g_hash_table_lookup(desktop_cache, class_name);
+    if (icon) return g_strdup(icon);
+
+    char *lower = g_utf8_strdown(class_name, -1);
+    icon = g_hash_table_lookup(desktop_cache, lower);
+    g_free(lower);
+    if (icon) return g_strdup(icon);
+
+    char *variations[6];
+    int count = 0;
+
+    char *no_suffix = g_strdup(class_name);
+    char *suffixes[] = {"-bin", "-main", "-app", "-client", "-server", NULL};
+    for (int i = 0; suffixes[i]; i++) {
+        char *found = strstr(no_suffix, suffixes[i]);
+        if (found) {
+            *found = '\0';
+            break;
+        }
+    }
+    variations[count++] = no_suffix;
+
+    char *no_prefix = g_strdup(class_name);
+    char *prefixes[] = {"lib", "org.", "com.", "net.", "io.", NULL};
+    for (int i = 0; prefixes[i]; i++) {
+        if (g_str_has_prefix(no_prefix, prefixes[i])) {
+            char *new = g_strdup(no_prefix + strlen(prefixes[i]));
+            g_free(no_prefix);
+            no_prefix = new;
+            break;
+        }
+    }
+    variations[count++] = no_prefix;
+
+    char *with_spaces = g_strdup(class_name);
+    for (char *p = with_spaces; *p; p++) {
+        if (*p == '_' || *p == '-') *p = ' ';
+    }
+    variations[count++] = with_spaces;
+
+    for (int i = 0; i < count; i++) {
+        if (variations[i]) {
+            char *var_lower = g_utf8_strdown(variations[i], -1);
+            icon = g_hash_table_lookup(desktop_cache, var_lower);
+            if (icon) {
+                g_free(var_lower);
+                for (int j = 0; j < count; j++) g_free(variations[j]);
+                return g_strdup(icon);
+            }
+            g_free(var_lower);
+
+            char *capitalized = g_strdup(variations[i]);
+            if (capitalized[0]) capitalized[0] = toupper(capitalized[0]);
+            icon = g_hash_table_lookup(desktop_cache, capitalized);
+            g_free(capitalized);
+            if (icon) {
+                for (int j = 0; j < count; j++) g_free(variations[j]);
+                return g_strdup(icon);
+            }
+        }
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (variations[i]) g_free(variations[i]);
+    }
+
+    return NULL;
+}
+
+static char *lookup_icon_name(const char *name, int themed_only) {
+    return themed_only ? find_icon_in_theme_only(name, ICON_SIZE) : find_icon_in_system(name);
+}
+
+static char* resolve_icon_path_for_class_pass(const char *class_name, int themed_only) {
+    char *path = NULL;
+
+    if (!desktop_cache) {
+        build_desktop_cache();
+    }
+
+    char *desktop_icon = get_icon_from_desktop(class_name);
+    if (desktop_icon) {
+        if (themed_only) {
+            // pass 1: ask the current theme for this icon by name (even if .desktop has a full path)
+            char *stem = icon_stem(desktop_icon);
+            path = find_icon_in_theme_only(stem, ICON_SIZE);
+            g_free(stem);
+        } else {
+            if (desktop_icon[0] == '/') {
+                if (file_exists(desktop_icon)) {
+                    return desktop_icon;
+                }
+            }
+            path = find_icon_in_system(desktop_icon);
+        }
+        g_free(desktop_icon);
+        if (path) return path;
+    }
+
+    path = lookup_icon_name(class_name, themed_only);
+    if (path) return path;
+
+    char *lower_class = g_utf8_strdown(class_name, -1);
+    path = lookup_icon_name(lower_class, themed_only);
+    if (path) {
+        g_free(lower_class);
+        return path;
+    }
+    g_free(lower_class);
+
+    char *variations[10];
+    int var_count = 0;
+
+    variations[var_count++] = g_strdup_printf("%s-icon", class_name);
+    variations[var_count++] = g_strdup_printf("%s-logo", class_name);
+    if (!themed_only) variations[var_count++] = g_strdup_printf("%s-symbolic", class_name);
+
+    char *no_sep = g_strdup(class_name);
+    for (char *p = no_sep; *p; p++) {
+        if (*p == ' ' || *p == '-' || *p == '_') {
+            memmove(p, p+1, strlen(p));
+            p--;
+        }
+    }
+    variations[var_count++] = no_sep;
+
+    for (int i = 0; i < var_count; i++) {
+        if (variations[i]) {
+            char *lower_var = g_utf8_strdown(variations[i], -1);
+            path = lookup_icon_name(lower_var, themed_only);
+            g_free(lower_var);
+            if (path) {
+                for (int j = 0; j < var_count; j++) g_free(variations[j]);
+                return path;
+            }
+        }
+    }
+
+    for (int i = 0; i < var_count; i++) {
+        if (variations[i]) g_free(variations[i]);
+    }
+
+    const char *special_cases[][2] = {
+        {"wezterm", "org.wezfurlong.wezterm"},
+        {"kitty", "kitty"},
+        {"code", "code"},
+        {"discord", "discord"},
+        {"firefox", "firefox"},
+        {"chrome", "google-chrome"},
+        {"chromium", "chromium"},
+        {"brave", "brave-browser"},
+        {"thunderbird", "thunderbird"},
+        {"vlc", "vlc"},
+        {"spotify", "spotify"},
+        {"steam", "steam"},
+        {"obs", "obs-studio"},
+        {"gimp", "gimp"},
+        {"inkscape", "inkscape"},
+        {"libreoffice", "libreoffice"},
+        {"terminal", "terminal"},
+        {"alacritty", "Alacritty"},
+        {"foot", "foot"},
+        {"st", "st"},
+        {"nvim", "neovim"},
+        {"vim", "gvim"},
+        {"emacs", "emacs"},
+        {"geany", "geany"},
+        {"gedit", "gedit"},
+        {"nano", "nano"},
+        {"htop", "htop"}
+    };
+
+    char *lower_check = g_utf8_strdown(class_name, -1);
+
+    for (size_t i = 0; i < sizeof(special_cases)/sizeof(special_cases[0]); i++) {
+        if (strstr(lower_check, special_cases[i][0])) {
+            path = lookup_icon_name(special_cases[i][1], themed_only);
+            if (path) {
+                g_free(lower_check);
+                return path;
+            }
+        }
+    }
+    g_free(lower_check);
+
+    if (themed_only) return NULL;   // pass 1 only looks at the current theme
+
+    const char *icon_themes[] = {
+        "Papirus", "Adwaita", "oxygen", "gnome", "breeze",
+        "elementary", "Numix", "Mint-X", "Mint-Y", "hicolor"
+    };
+
+    for (size_t i = 0; i < sizeof(icon_themes)/sizeof(icon_themes[0]); i++) {
+        char *theme_path = g_strdup_printf("/usr/share/icons/%s/scalable/apps/%s.svg",
+                                           icon_themes[i], class_name);
+        if (file_exists(theme_path)) {
+            return theme_path;
+        }
+        g_free(theme_path);
+
+        theme_path = g_strdup_printf("/usr/share/icons/%s/48x48/apps/%s.png",
+                                     icon_themes[i], class_name);
+        if (file_exists(theme_path)) {
+            return theme_path;
+        }
+        g_free(theme_path);
+
+        char *lower_name = g_utf8_strdown(class_name, -1);
+        theme_path = g_strdup_printf("/usr/share/icons/%s/scalable/apps/%s.svg",
+                                     icon_themes[i], lower_name);
+        g_free(lower_name);
+        if (file_exists(theme_path)) {
+            return theme_path;
+        }
+        g_free(theme_path);
+    }
+
+    return NULL;
+}
+
+
+// 1) look for the app icon (all name guesses) in the CURRENT icon theme first,
+// 2) only then fall back to .desktop absolute paths, hicolor and any other theme.
+static char* resolve_icon_path_for_class_uncached(const char *class_name) {
+    char *p = resolve_icon_path_for_class_pass(class_name, 1);
+    if (!p) p = resolve_icon_path_for_class_pass(class_name, 0);
+    return p;
+}
+
+char* get_icon_path_for_class(const char *class_name) {
+    if (!class_name) return NULL;
+
+    if (!icon_resolve_cache) {
+        icon_resolve_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    }
+
+    gpointer cached = g_hash_table_lookup(icon_resolve_cache, class_name);
+    if (cached) {
+        const char *cached_str = (const char *)cached;
+        return cached_str[0] ? g_strdup(cached_str) : NULL;
+    }
+
+    char *resolved = resolve_icon_path_for_class_uncached(class_name);
+
+    g_hash_table_insert(icon_resolve_cache, g_strdup(class_name),
+                        g_strdup(resolved ? resolved : ""));
+
+    return resolved;
+}
+
+
+AppGroup* get_grouped_apps(Display *display, int *group_count) {
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+
+    Atom client_list = XInternAtom(display, "_NET_CLIENT_LIST", True);
+    Window root = DefaultRootWindow(display);
+
+    *group_count = 0;
+    if (client_list == None) return NULL;
+
+    if (XGetWindowProperty(display, root, client_list, 0, 1024, False,
+        XA_WINDOW, &actual_type, &actual_format,
+        &nitems, &bytes_after, &prop) != Success || !prop) {
+        return NULL;
+        }
+
+        Window *windows = (Window *)prop;
+    AppGroup *groups = calloc(MAX_GROUPS, sizeof(AppGroup));
+    int g_count = 0;
+
+    for (unsigned long i = 0; i < nitems; i++) {
+        XWindowAttributes attrs;
+        if (!XGetWindowAttributes(display, windows[i], &attrs)) continue;
+        if (attrs.map_state != IsViewable) continue;
+        if (attrs.width < 50 || attrs.height < 50) continue;
+
+        char *class_name = get_window_class(display, windows[i]);
+        if (!class_name) continue;
+
+        int found_idx = -1;
+        for (int j = 0; j < g_count; j++) {
+            if (strcasecmp(groups[j].class_name, class_name) == 0) {
+                found_idx = j;
+                break;
+            }
+        }
+
+        if (found_idx != -1) {
+            if (groups[found_idx].window_count < MAX_WINDOWS_PER_GROUP) {
+                groups[found_idx].windows[groups[found_idx].window_count++] = windows[i];
+            }
+            free(class_name);
+        } else if (g_count < MAX_GROUPS) {
+            groups[g_count].class_name = class_name;
+            groups[g_count].icon_path = get_icon_path_for_class(class_name);
+            groups[g_count].windows[0] = windows[i];
+            groups[g_count].window_count = 1;
+            g_count++;
+        } else {
+            free(class_name);
+        }
+    }
+
+    XFree(prop);
+    *group_count = g_count;
+    return groups;
+}
+
+void launch_rofi() {
+    pid_t pid = fork();
+    // if (pid == 0) {
+    //     execlp("rofi", "rofi", "-show", "drun", "-display-drun", "Apps", NULL);
+    //     exit(0);
+    // }
+    if (pid == 0) {
+        execlp("/home/hammad/wm/apps-launcher/apps-launcher.sh", NULL);
+        exit(0);
+    }
+    // if (pid == 0) {
+    //     execl("/bin/bash",
+    //           "bash",
+    //           "/home/hammad/wm/apps-launcher/apps-launcher.sh",
+    //           (char *)NULL);
+    //
+    //     perror("apps-launcher");
+    //     _exit(127);
+    // }
+}
+
+void draw_icon(cairo_t *cr, const char *icon_path, double x, double y, double width, double height) {
+    if (!file_exists(icon_path)) return;
+
+    if (g_str_has_suffix(icon_path, ".png") || g_str_has_suffix(icon_path, ".xpm")) {
+        cairo_surface_t *image = cairo_image_surface_create_from_png(icon_path);
+        if (cairo_surface_status(image) == CAIRO_STATUS_SUCCESS) {
+            int img_w = cairo_image_surface_get_width(image);
+            int img_h = cairo_image_surface_get_height(image);
+
+            cairo_save(cr);
+            cairo_translate(cr, x, y);
+            cairo_scale(cr, width / img_w, height / img_h);
+            cairo_set_source_surface(cr, image, 0, 0);
+            cairo_paint(cr);
+            cairo_restore(cr);
+            cairo_surface_destroy(image);
+            return;
+        }
+        cairo_surface_destroy(image);
+    } else {
+        GError *error = NULL;
+        RsvgHandle *handle = rsvg_handle_new_from_file(icon_path, &error);
+        if (handle && !error) {
+            RsvgRectangle viewport = { .x = x, .y = y, .width = width, .height = height };
+            cairo_save(cr);
+            rsvg_handle_render_document(handle, cr, &viewport, NULL);
+            cairo_restore(cr);
+            g_object_unref(handle);
+            return;
+        }
+        if (error) {
+            g_error_free(error);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Launcher icon + ccmenu launcher                                    */
+/* ------------------------------------------------------------------ */
+
+// Launcher icon: first from the current icon theme, then from anywhere on the system
+char* get_rofi_icon_path() {
+    const char *rofi_names[] = {
+        "view-app-grid-symbolic",
+        "view-grid-symbolic",
+        "org.gnome.Software",
+        "gnome-panel-launcher",
+        "system-search-symbolic",
+        "system-search",
+        "launcher-program",
+        "preferences-system-search",
+        "rofi",
+        "rofi-symbolic",
+        "search",
+        "search-symbolic",
+        "application-x-executable",
+        "applications-other",
+        "applications",
+        "start-here"
+    };
+    const size_t n = sizeof(rofi_names) / sizeof(rofi_names[0]);
+
+    if (LAUNCHER_ICON_NAME[0]) {
+        char *path = NULL;
+        if (LAUNCHER_ICON_NAME[0] == '/') {
+            // full path given: let the active theme override it (same icon name), keep the file as fallback
+            char *stem = icon_stem(LAUNCHER_ICON_NAME);
+            path = find_icon_in_theme_only(stem, 24);
+            g_free(stem);
+            if (!path && file_exists(LAUNCHER_ICON_NAME)) path = g_strdup(LAUNCHER_ICON_NAME);
+        } else {
+            path = find_icon_in_current_theme(LAUNCHER_ICON_NAME, 24);
+            if (!path) path = find_icon_in_system(LAUNCHER_ICON_NAME);
+        }
+        if (path) return path;
+    }
+
+    for (size_t i = 0; i < n; i++) {            // pass 1: follow the icon theme
+        char *path = find_icon_in_current_theme(rofi_names[i], 24);
+        if (path) return path;
+    }
+    for (size_t i = 0; i < n; i++) {            // pass 2: any icon on the system
+        char *path = find_icon_in_system(rofi_names[i]);
+        if (path) return path;
+    }
+    return NULL;
+}
+
+void launch_ccmenu() {
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        execl("/bin/sh", "sh", "-c", CCMENU_CMD, (char *)NULL);
+        _exit(127);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Painting                                                           */
+/* ------------------------------------------------------------------ */
+
+static void draw_separator(cairo_t *cr, double x) {
+    SET_TEXT(cr, 0.12);
+    cairo_rectangle(cr, x, 12, 1, PANEL_HEIGHT - 24);
+    cairo_fill(cr);
+}
+
+// static void draw_panel_background(cairo_t *cr, int w) {
+//     // Solid black panel to match the blackcc control-center icon.
+//     rounded_rect_path(cr, 0.5, 0.5, w - 1, PANEL_HEIGHT - 1, PANEL_RADIUS);
+//     cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.98);
+//     cairo_fill_preserve(cr);
+//
+//     // Very subtle dark rim, keeping the panel visually black.
+//     cairo_set_source_rgba(cr, 0.10, 0.10, 0.10, 0.95);
+//     cairo_set_line_width(cr, 1.0);
+//     cairo_stroke(cr);
+// }
+static void draw_panel_background(cairo_t *cr, int w) {
+    // Transparent / Translucent Breeze Dark background (alpha = 0.65)
+    rounded_rect_path(cr, 0.5, 0.5, w - 1, PANEL_HEIGHT - 1, PANEL_RADIUS);
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.90);
+    cairo_fill_preserve(cr);
+
+    // Subtle border for glass effect
+    cairo_set_source_rgba(cr, 0.30, 0.30, 0.30, 0.40);
+    cairo_set_line_width(cr, 1.0);
+    cairo_stroke(cr);
+}
+
+// Application launcher button (left side, like Kickoff)
+static void draw_launcher(cairo_t *cr, int hovered) {
+    if (!g_launcher_icon_resolved) {          // resolve once (reset when the icon theme changes)
+        g_launcher_icon_path = get_rofi_icon_path();
+        g_launcher_icon_resolved = 1;
+    }
+    const char *icon_path = g_launcher_icon_path;
+
+    double bx = EDGE_PAD, by = BTN_Y;
+
+    if (hovered) {
+        rounded_rect_path(cr, bx + 0.5, by + 0.5, LAUNCHER_W - 1, TASK_H - 1, BTN_RADIUS);
+        SET_ACCENT(cr, 0.16);
+        cairo_fill_preserve(cr);
+        SET_ACCENT(cr, 0.55);
+        cairo_set_line_width(cr, 1.0);
+        cairo_stroke(cr);
+    }
+
+    double sz = 34;
+    double ix = bx + (LAUNCHER_W - sz) / 2.0;
+    double iy = by + (TASK_H - sz) / 2.0;
+
+    if (icon_path && g_str_has_suffix(icon_path, ".svg") && strstr(icon_path, "symbolic")) {
+        // symbolic icons are monochrome: recolour them to the panel text colour
+        GError *error = NULL;
+        RsvgHandle *handle = rsvg_handle_new_from_file(icon_path, &error);
+        if (handle && !error) {
+            cairo_surface_t *rec_surf = cairo_recording_surface_create(CAIRO_CONTENT_COLOR_ALPHA, NULL);
+            cairo_t *rec_cr = cairo_create(rec_surf);
+
+            RsvgRectangle viewport = { .x = 0, .y = 0, .width = sz, .height = sz };
+            rsvg_handle_render_document(handle, rec_cr, &viewport, NULL);
+            cairo_destroy(rec_cr);
+
+            cairo_save(cr);
+            SET_TEXT(cr, 0.95);
+            cairo_mask_surface(cr, rec_surf, ix, iy);
+            cairo_restore(cr);
+
+            cairo_surface_destroy(rec_surf);
+            g_object_unref(handle);
+            return;
+        }
+        if (handle) g_object_unref(handle);
+        if (error) g_error_free(error);
+    } else if (icon_path) {
+        // regular themed icon: draw it exactly as the theme designed it
+        draw_icon(cr, icon_path, ix, iy, sz, sz);
+        return;
+    }
+
+    draw_app_grid_icon(cr, ix, iy, sz, 0.937, 0.941, 0.945, 0.95);
+}
+
+// One icon-only task button (Plasma "Icons-only Task Manager")
+static void draw_task(cairo_t *cr, int i, AppGroup *g, int is_active, int is_hovered) {
+    double bx = task_x(i), by = BTN_Y;
+
+    if (is_active || is_hovered) {
+        rounded_rect_path(cr, bx + 0.5, by + 0.5, TASK_W - 1, TASK_H - 1, BTN_RADIUS);
+        double fill = is_active ? (is_hovered ? 0.30 : 0.20) : 0.14;
+        SET_ACCENT(cr, fill);
+        cairo_fill_preserve(cr);
+        SET_ACCENT(cr, is_hovered ? 0.55 : 0.30);
+        cairo_set_line_width(cr, 1.0);
+        cairo_stroke(cr);
+    }
+
+    double ix = bx + (TASK_W - ICON_SIZE) / 2.0;
+    double iy = by + (TASK_H - ICON_SIZE) / 2.0 - 1;
+
+    if (i == bouncing_group_idx) {
+        iy -= sin(bounce_progress * M_PI) * BOUNCE_HEIGHT;
+    }
+
+    if (g->icon_path && file_exists(g->icon_path)) {
+        draw_icon(cr, g->icon_path, ix, iy, ICON_SIZE, ICON_SIZE);
+    } else {
+        // Fallback: coloured tile with the first letter
+        rounded_rect_path(cr, ix + 1, iy + 1, ICON_SIZE - 2, ICON_SIZE - 2, 7);
+        cairo_pattern_t *fb = cairo_pattern_create_linear(ix, iy, ix, iy + ICON_SIZE);
+        cairo_pattern_add_color_stop_rgb(fb, 0.0, 0.30, 0.74, 0.95);
+        cairo_pattern_add_color_stop_rgb(fb, 1.0, 0.16, 0.50, 0.78);
+        cairo_set_source(cr, fb);
+        cairo_fill(cr);
+        cairo_pattern_destroy(fb);
+
+        if (g->class_name && g->class_name[0]) {
+            char letter[2] = { (char)toupper((unsigned char)g->class_name[0]), '\0' };
+            cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+            cairo_set_font_size(cr, 14);
+            cairo_text_extents_t ext;
+            cairo_text_extents(cr, letter, &ext);
+            SET_TEXT(cr, 1.0);
+            cairo_move_to(cr, ix + ICON_SIZE / 2.0 - ext.width / 2.0 - ext.x_bearing,
+                              iy + ICON_SIZE / 2.0 - ext.height / 2.0 - ext.y_bearing);
+            cairo_show_text(cr, letter);
+        }
+    }
+
+    // Running indicator: long accent bar for the focused app, short dim bar otherwise
+    double ind_h = 2.5;
+    double ind_w = is_active ? (TASK_W - 16) : 10;
+    double ind_x = bx + (TASK_W - ind_w) / 2.0;
+    double ind_y = by + TASK_H - ind_h - 2;
+    rounded_rect_path(cr, ind_x, ind_y, ind_w, ind_h, ind_h / 2.0);
+    if (is_active) SET_ACCENT(cr, 1.0); else SET_TEXT(cr, 0.55);
+    cairo_fill(cr);
+
+    // Window-count badge
+    if (g->window_count > 1) {
+        double r = 6.5;
+        double cx = ix + ICON_SIZE - 1;
+        double cy = iy + 4;
+
+        cairo_arc(cr, cx, cy, r + 1.2, 0, 2 * M_PI);       // ring in panel colour
+        cairo_set_source_rgba(cr, 0.13, 0.14, 0.155, 1.0);
+        cairo_fill(cr);
+
+        cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
+        SET_ACCENT(cr, 1.0);
+        cairo_fill(cr);
+
+        char count_str[8];
+        snprintf(count_str, sizeof(count_str), "%d", g->window_count);
+        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+        cairo_set_font_size(cr, 9);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, count_str, &ext);
+        cairo_set_source_rgb(cr, 1, 1, 1);
+        cairo_move_to(cr, cx - ext.width / 2.0 - ext.x_bearing, cy - ext.height / 2.0 - ext.y_bearing);
+        cairo_show_text(cr, count_str);
+    }
+}
+
+static void draw_ccmenu_button(cairo_t *cr, int w, int hovered) {
+    double bx = ccmenu_x(w), by = BTN_Y;
+
+    rounded_rect_path(cr, bx + 0.5, by + 0.5, CCMENU_W - 1, TASK_H - 1, BTN_RADIUS);
+
+    // Background complete transparent kar diya (alpha = 0.0)
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.0);
+    cairo_fill_preserve(cr);
+
+    // Hover hone par halke highlight ka border
+    if (hovered) SET_ACCENT(cr, 0.80); else SET_TEXT(cr, 0.16);
+    cairo_set_line_width(cr, 1.0);
+    cairo_stroke(cr);
+
+    double cx = bx + CCMENU_W / 2.0;
+    double cy = by + TASK_H / 2.0;
+    double half = 8.5;
+    double knob_x[2] = { cx + 3.5, cx - 3.5 };
+    double row_y[2]  = { cy - 4.5, cy + 4.5 };
+
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_width(cr, 2.0);
+    for (int r = 0; r < 2; r++) {
+        SET_TEXT(cr, hovered ? 0.75 : 0.55);
+        cairo_move_to(cr, cx - half, row_y[r]);
+        cairo_line_to(cr, cx + half, row_y[r]);
+        cairo_stroke(cr);
+
+        // Cut-out background ko bhi transparent rakha
+        cairo_arc(cr, knob_x[r], row_y[r], 4.4, 0, 2 * M_PI);
+        cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.0);
+        cairo_fill(cr);
+
+        cairo_arc(cr, knob_x[r], row_y[r], 3.0, 0, 2 * M_PI);
+        SET_ACCENT(cr, 1.0);
+        cairo_fill(cr);
+    }
+}
+
+// Digital clock (time over date, like Plasma's default)
+static void draw_clock(cairo_t *cr, int w) {
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+
+    char tbuf[24], dbuf[32];
+    strftime(tbuf, sizeof(tbuf), CLOCK_FORMAT, &tmv);
+    strftime(dbuf, sizeof(dbuf), "%a %d %b", &tmv);
+
+    double cx = clock_x(w) + CLOCK_W / 2.0;
+
+    cairo_text_extents_t ext;
+
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr, 13);
+    cairo_text_extents(cr, tbuf, &ext);
+    SET_TEXT(cr, 0.97);
+    cairo_move_to(cr, cx - ext.width / 2.0 - ext.x_bearing, 21);
+    cairo_show_text(cr, tbuf);
+
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 9.5);
+    cairo_text_extents(cr, dbuf, &ext);
+    SET_TEXT(cr, 0.68);
+    cairo_move_to(cr, cx - ext.width / 2.0 - ext.x_bearing, 35);
+    cairo_show_text(cr, dbuf);
+}
+
+static void draw_workspace_pager(cairo_t *cr, int hovered_item) {
+    int total = desktop_count();
+    if (total < 1) total = 1;
+    int max_first = total - PAGER_TILES;
+    if (max_first < 0) max_first = 0;
+    if (pager_first > max_first) pager_first = max_first;
+    if (pager_first < 0) pager_first = 0;
+
+    int visible = total - pager_first;
+    if (visible > PAGER_TILES) visible = PAGER_TILES;
+    int active = current_desktop();
+    if (active < 0) active = 0;
+    int px = pager_x(g_dock_w);
+    int hovered_slot = -1;
+    if (hovered_item <= HIT_PAGER_BASE && hovered_item > HIT_PAGER_BASE - PAGER_TILES)
+        hovered_slot = HIT_PAGER_BASE - hovered_item;
+
+    for (int slot = 0; slot < visible; slot++) {
+        int desktop = pager_first + slot;
+        double x = px + slot * PAGER_TILE_W + 2;
+        double y = BTN_Y + 7;
+        double w = PAGER_TILE_W - 4;
+        double h = TASK_H - 14;
+        rounded_rect_path(cr, x, y, w, h, 4);
+        if (desktop == active) SET_ACCENT(cr, 0.90);
+        else if (slot == hovered_slot) SET_TEXT(cr, 0.16);
+        else SET_TEXT(cr, 0.07);
+        cairo_fill_preserve(cr);
+        if (desktop == active) SET_ACCENT(cr, 0.95);
+        else SET_TEXT(cr, 0.20);
+        cairo_set_line_width(cr, 1.0);
+        cairo_stroke(cr);
+
+        char label[8];
+        snprintf(label, sizeof(label), "%d", desktop + 1);
+        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL,
+                               desktop == active ? CAIRO_FONT_WEIGHT_BOLD : CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, 11);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, label, &ext);
+        if (desktop == active) SET_TEXT(cr, 1.0); else SET_TEXT(cr, 0.78);
+        cairo_move_to(cr, x + (w - ext.width) / 2.0 - ext.x_bearing,
+                      y + (h - ext.height) / 2.0 - ext.y_bearing);
+        cairo_show_text(cr, label);
+    }
+}
+
+void redraw_dock(void) {
+    int group_count = 0;
+    AppGroup *groups = get_grouped_apps(g_display, &group_count);
+    Window active = get_active_window(g_display);
+
+    if (!dock_surface) {
+        dock_surface = cairo_xlib_surface_create(g_display, dock_win, g_vinfo.visual,
+                                                 g_dock_w, PANEL_HEIGHT);
+        dock_cr = cairo_create(dock_surface);
+    }
+
+    cairo_surface_t *buffer = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, g_dock_w, PANEL_HEIGHT);
+    cairo_t *bcr = cairo_create(buffer);
+
+    cairo_set_operator(bcr, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(bcr);
+    cairo_set_operator(bcr, CAIRO_OPERATOR_OVER);
+
+    draw_panel_background(bcr, g_dock_w);
+
+    // Left: Rofi launcher + nearby app icons; right: KDE-style desktops, clock, menu.
+    draw_launcher(bcr, hover_item == HIT_LAUNCHER);
+    // draw_separator(bcr, EDGE_PAD + LAUNCHER_W + SECTION_GAP / 2.0);
+
+    int task_limit_x = pager_x(g_dock_w) - SECTION_GAP;
+    int max_visible_tasks = (task_limit_x > TASKS_X)
+        ? (task_limit_x - TASKS_X + TASK_GAP) / (TASK_W + TASK_GAP) : 0;
+    if (max_visible_tasks > group_count) max_visible_tasks = group_count;
+    for (int i = 0; i < max_visible_tasks; i++) {
+        draw_task(bcr, i, &groups[i], group_has_window(&groups[i], active), hover_item == i);
+    }
+
+    draw_workspace_pager(bcr, hover_item);
+    draw_clock(bcr, g_dock_w);
+    draw_ccmenu_button(bcr, g_dock_w, hover_item == HIT_CCMENU);
+
+    free_groups(groups, group_count);
+
+    cairo_surface_flush(buffer);
+
+    cairo_set_operator(dock_cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_surface(dock_cr, buffer, 0, 0);
+    cairo_paint(dock_cr);
+    cairo_surface_flush(dock_surface);
+
+    cairo_destroy(bcr);
+    cairo_surface_destroy(buffer);
+}
+
+int main() {
+    Display *display = XOpenDisplay(NULL);
+    if (!display) {
+        fprintf(stderr, "Cannot open X display\n");
+        return 1;
+    }
+    XSetErrorHandler(x_error_handler);
+    g_display = display;
+
+    build_desktop_cache();
+
+    int screen = DefaultScreen(display);
+    g_screen = screen;
+    g_screen_width = DisplayWidth(display, screen);
+    g_screen_height = DisplayHeight(display, screen);
+
+    Window root = RootWindow(display, screen);
+
+    if (!XMatchVisualInfo(display, screen, 32, TrueColor, &g_vinfo)) {
+        fprintf(stderr, "my_dock: no 32-bit TrueColor visual available\n");
+        return 1;
+    }
+
+    XSetWindowAttributes wattrs;
+    wattrs.override_redirect = False;
+    wattrs.background_pixel = 0;
+    wattrs.border_pixel = 0;
+    wattrs.colormap = XCreateColormap(display, root, g_vinfo.visual, AllocNone);
+
+    // Full-width panel pinned to the bottom edge
+    g_dock_w = g_screen_width - 2 * PANEL_MARGIN;
+    g_dock_x = PANEL_MARGIN;
+    g_dock_y = g_screen_height - PANEL_HEIGHT - PANEL_MARGIN;
+
+    Window win = XCreateWindow(
+        display, root,
+        g_dock_x, g_dock_y, g_dock_w, PANEL_HEIGHT, 0,
+        g_vinfo.depth, InputOutput, g_vinfo.visual,
+        CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWColormap, &wattrs
+    );
+    dock_win = win;
+
+    Atom net_client_list = XInternAtom(display, "_NET_CLIENT_LIST", False);
+    Atom net_active_win  = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+    net_current_desktop_atom = XInternAtom(display, "_NET_CURRENT_DESKTOP", False);
+    net_number_desktops_atom = XInternAtom(display, "_NET_NUMBER_OF_DESKTOPS", False);
+    XSelectInput(display, root, PropertyChangeMask);
+
+    Atom wm_type = XInternAtom(display, "_NET_WM_WINDOW_TYPE", False);
+    Atom wm_dock = XInternAtom(display, "_NET_WM_WINDOW_TYPE_DOCK", False);
+    XChangeProperty(display, win, wm_type, XA_ATOM, 32, PropModeReplace, (unsigned char *)&wm_dock, 1);
+
+    Atom net_wm_state = XInternAtom(display, "_NET_WM_STATE", False);
+    Atom state_atoms[2];
+    state_atoms[0] = XInternAtom(display, "_NET_WM_STATE_ABOVE", False);
+    state_atoms[1] = XInternAtom(display, "_NET_WM_STATE_STICKY", False);
+    XChangeProperty(display, win, net_wm_state, XA_ATOM, 32, PropModeReplace, (unsigned char *)state_atoms, 2);
+
+    // Reserve screen space (panel width is fixed now, so this is set once)
+    unsigned long bottom = PANEL_HEIGHT + PANEL_MARGIN;
+    unsigned long strut[4] = {0, 0, 0, bottom};
+    XChangeProperty(display, win, XInternAtom(display, "_NET_WM_STRUT", False),
+                    XA_CARDINAL, 32, PropModeReplace, (unsigned char *)strut, 4);
+    unsigned long strut_partial[12] = {0, 0, 0, bottom, 0, 0, 0, 0, 0, 0,
+                                       0, (unsigned long)(g_screen_width - 1)};
+    XChangeProperty(display, win, XInternAtom(display, "_NET_WM_STRUT_PARTIAL", False),
+                    XA_CARDINAL, 32, PropModeReplace, (unsigned char *)strut_partial, 12);
+
+    XSelectInput(display, win, ExposureMask | ButtonPressMask | KeyPressMask | PointerMotionMask | LeaveWindowMask);
+    XMapWindow(display, win);
+
+    redraw_dock();
+
+    int last_minute = -1;
+    int theme_poll_tick = 0;
+    XEvent ev;
+    while (1) {
+        while (XPending(display)) {
+            XNextEvent(display, &ev);
+
+            if (ev.type == Expose) {
+                if (ev.xexpose.count == 0) redraw_dock();
+
+            } else if (ev.type == PropertyNotify &&
+                       (ev.xproperty.atom == net_client_list || ev.xproperty.atom == net_active_win || ev.xproperty.atom == net_current_desktop_atom || ev.xproperty.atom == net_number_desktops_atom)) {
+                // coalesce bursts of window-list / focus changes into one redraw
+                XEvent peek;
+                while (XPending(display)) {
+                    XPeekEvent(display, &peek);
+                    if (peek.type == PropertyNotify &&
+                        (peek.xproperty.atom == net_client_list || peek.xproperty.atom == net_active_win || peek.xproperty.atom == net_current_desktop_atom || peek.xproperty.atom == net_number_desktops_atom)) {
+                        XNextEvent(display, &peek);
+                    } else {
+                        break;
+                    }
+                }
+                redraw_dock();
+
+            } else if (ev.type == MotionNotify && ev.xmotion.window == win) {
+                int group_count = 0;
+                AppGroup *groups = get_grouped_apps(display, &group_count);
+                int item = hit_test(ev.xmotion.x, ev.xmotion.y, group_count);
+                int changed = 0;
+
+                if (item != hover_item) {
+                    hover_item = item;
+                    changed = 1;
+                }
+
+                if (item >= 0 && groups) {
+                    if (hovered_group_idx != item) {
+                        hovered_group_idx = item;
+                        show_popup(display, screen, g_dock_x + task_x(item) + TASK_W / 2, g_dock_y, &groups[item]);
+                        changed = 1;
+                    }
+                } else if (hovered_group_idx != -1) {
+                    hide_popup(display);
+                    changed = 1;
+                }
+
+                free_groups(groups, group_count);
+                if (changed) redraw_dock();
+
+            } else if (ev.type == LeaveNotify && (ev.xcrossing.window == win || ev.xcrossing.window == popup_win)) {
+                Window root_ret, child_ret;
+                int root_x, root_y, win_x, win_y;
+                unsigned int mask;
+                XQueryPointer(display, root, &root_ret, &child_ret,
+                              &root_x, &root_y, &win_x, &win_y, &mask);
+
+                int over_dock = (root_x >= g_dock_x && root_x < g_dock_x + g_dock_w &&
+                                 root_y >= g_dock_y && root_y < g_dock_y + PANEL_HEIGHT);
+
+                if (!over_dock && !point_in_popup(root_x, root_y)) {
+                    hide_popup(display);
+                    hover_item = HIT_NONE;
+                    redraw_dock();
+                }
+
+            } else if (ev.type == ButtonPress) {
+                // Click inside the window-list popup
+                if (ev.xbutton.window == popup_win) {
+                    int rel = ev.xbutton.y - 5;
+                    int clicked_idx = (rel >= 0) ? rel / POPUP_ITEM_H : -1;
+
+                    int group_count = 0;
+                    AppGroup *groups = get_grouped_apps(display, &group_count);
+
+                    if (groups && hovered_group_idx >= 0 && hovered_group_idx < group_count &&
+                        clicked_idx >= 0 && clicked_idx < groups[hovered_group_idx].window_count) {
+                        activate_window(display, groups[hovered_group_idx].windows[clicked_idx]);
+                    }
+                    free_groups(groups, group_count);
+
+                    hide_popup(display);
+                    redraw_dock();
+                    continue;
+                }
+
+                if (ev.xbutton.window != win) continue;
+
+                // Mouse wheel scrolls the pager without changing button sizes.
+                // if ((ev.xbutton.button == Button4 || ev.xbutton.button == Button5) &&
+                //     ev.xbutton.x >= pager_x(g_dock_w) &&
+                //     ev.xbutton.x < pager_x(g_dock_w) + PAGER_W) {
+                //     int total = desktop_count();
+                //     int max_first = total - PAGER_TILES;
+                //     if (max_first < 0) max_first = 0;
+                //     pager_first += (ev.xbutton.button == Button4) ? -1 : 1;
+                //     if (pager_first < 0) pager_first = 0;
+                //     if (pager_first > max_first) pager_first = max_first;
+                //     redraw_dock();
+                //     continue;
+                // }
+                // Mouse wheel scrolls the pager without changing button sizes.
+                if ((ev.xbutton.button == Button4 || ev.xbutton.button == Button5) &&
+                    ev.xbutton.x >= pager_x(g_dock_w) &&
+                    ev.xbutton.x < pager_x(g_dock_w) + get_pager_width()) {
+                    int total = desktop_count();
+                int max_first = total - PAGER_TILES;
+                if (max_first < 0) max_first = 0;
+                pager_first += (ev.xbutton.button == Button4) ? -1 : 1;
+                    if (pager_first < 0) pager_first = 0;
+                    if (pager_first > max_first) pager_first = max_first;
+                    redraw_dock();
+                    continue;
+                    }
+
+                // Click on the panel itself
+                int group_count = 0;
+                AppGroup *groups = get_grouped_apps(display, &group_count);
+                int item = hit_test(ev.xbutton.x, ev.xbutton.y, group_count);
+
+                /*if (item == HIT_LAUNCHER) {
+                    hide_popup(display);
+                    launch_rofi();
+                } else if (item == HIT_CCMENU) {
+                    hide_popup(display);
+                    launch_ccmenu();
+                }*/
+                if (item == HIT_LAUNCHER) {
+                    hide_popup(display);
+                    launch_rofi();
+                    hover_item = HIT_NONE; // <-- Yeh line yahan jodhni hai
+                } else if (item == HIT_CCMENU) {
+                    hide_popup(display);
+                    launch_ccmenu();
+                    hover_item = HIT_NONE; // <-- Yahan bhi chahein toh add kar sakte hain
+                }else if (item <= HIT_PAGER_BASE && item > HIT_PAGER_BASE - PAGER_TILES) {
+                    hide_popup(display);
+                    int slot = HIT_PAGER_BASE - item;
+                    switch_desktop(pager_first + slot);
+                } else if (item >= 0 && groups) {
+                    AppGroup *g = &groups[item];
+
+                    trigger_icon_bounce(item);
+                    hide_popup(display);
+
+                    if (g->window_count == 1) {
+                        activate_window(display, g->windows[0]);
+                    } else if (g->window_count > 1) {
+                        current_window_cycle_index[item] =
+                            (current_window_cycle_index[item] + 1) % g->window_count;
+                        activate_window(display, g->windows[current_window_cycle_index[item]]);
+                    }
+                }
+
+                free_groups(groups, group_count);
+                redraw_dock();
+            }
+        }
+
+        // Keep the clock current
+        time_t now = time(NULL);
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        if (tmv.tm_min != last_minute) {
+            last_minute = tmv.tm_min;
+            redraw_dock();
+        }
+
+        if (bouncing_group_idx != -1) {
+            bounce_progress += 0.016 / BOUNCE_DURATION;
+            if (bounce_progress >= 1.0) {
+                bouncing_group_idx = -1;
+                bounce_progress = 0.0;
+            }
+            redraw_dock();
+        }
+
+        if (++theme_poll_tick >= 120) {          // ~every 2 s: did the user switch icon theme?
+            theme_poll_tick = 0;
+            if (icon_theme_check_changed()) redraw_dock();
+        }
+
+        usleep(16666);
+    }
+
+    if (desktop_cache) {
+        g_hash_table_destroy(desktop_cache);
+    }
+    if (icon_resolve_cache) {
+        g_hash_table_destroy(icon_resolve_cache);
+    }
+
+    if (dock_cr) cairo_destroy(dock_cr);
+    if (dock_surface) cairo_surface_destroy(dock_surface);
+    XCloseDisplay(display);
+    return 0;
+}
