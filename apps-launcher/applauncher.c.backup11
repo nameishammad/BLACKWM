@@ -1,0 +1,2310 @@
+#define _GNU_SOURCE
+#include <X11/keysym.h>
+#include <cairo-xcb.h>
+#include <cairo.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <gdk-pixbuf/gdk-pixbuf.h>
+#include <gdk/gdk.h>
+#include <gtk/gtk.h>
+#include <math.h>
+#include <pwd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <xcb/xcb.h>
+#include <xcb/xcb_keysyms.h>
+
+#define MAX_APPS 1024
+#define NAME_LEN 264
+#define EXEC_LEN 512
+#define ICON_LEN 264
+#define ID_LEN 264
+#define SEARCH_LEN 256
+
+/* ---------------- panel geometry (panel-local pixels) ---------------- */
+#define PANEL_W 630
+#define PANEL_H 530
+#define PANEL_R 8
+
+/* where the window sits on screen (bottom-left) */
+#define LAUNCH_MARGIN_X 10
+#define LAUNCH_MARGIN_BOTTOM 58 /* leave room for a taskbar/dock */
+
+/* header */
+#define HEADER_H 52
+#define AVATAR_R 15
+#define SEARCH_X 236
+#define SEARCH_Y 12
+#define SEARCH_W 264
+#define SEARCH_H 28
+
+/* sidebar */
+#define SIDE_W 204
+#define SIDE_LIST_Y 58
+#define SIDE_GAP 14
+#define SIDE_ICON 20
+
+/* bottom bar */
+#define BAR_H 44
+#define BAR_Y (PANEL_H - BAR_H)
+
+/* grid */
+#define COLS 4
+#define VROWS 4
+#define COL_W 100
+#define ROW_H 100
+#define GRID_X (SIDE_W + 10)
+#define GRID_Y 60
+#define TILE_W 82
+#define TILE_H 104
+#define ICON 50
+
+/* Breeze dark colours */
+#define BG_R 0.0
+#define BG_G 0.0
+#define BG_B 0.0
+#define BG_A 0.80
+#define ACC_R 0.239
+#define ACC_G 0.682
+#define ACC_B 0.914
+
+/* ---------------- sections ---------------- */
+enum {
+  SEC_FAV = 0,
+  SEC_ALL,
+  SEC_DEV,
+  SEC_EDU,
+  SEC_GAMES,
+  SEC_GRAPHICS,
+  SEC_INTERNET,
+  SEC_MULTIMEDIA,
+  SEC_OFFICE,
+  SEC_SETTINGS,
+  SEC_SYSTEM,
+  SEC_UTILITIES,
+  SEC_HELP,
+  SEC_COUNT
+};
+#define SEC_PLACES SEC_COUNT /* hidden bit used by the Places entries */
+
+static const char *SEC_NAMES[SEC_COUNT] = {
+    "Favorites", "All Applications", "Development", "Education", "Games",
+    "Graphics",  "Internet",         "Multimedia",  "Office",    "Settings",
+    "System",    "Utilities",        "Help"};
+
+/* theme icon names tried for each sidebar entry */
+static const char *SEC_ICON[SEC_COUNT][2] = {
+    {NULL, NULL},
+    {NULL, NULL},
+    {"applications-development", NULL},
+    {"applications-education", "applications-science"},
+    {"applications-games", NULL},
+    {"applications-graphics", NULL},
+    {"applications-internet", NULL},
+    {"applications-multimedia", NULL},
+    {"applications-office", NULL},
+    {"preferences-system", "preferences-other"},
+    {"applications-system", NULL},
+    {"applications-utilities", NULL},
+    {"help-browser", "help-contents"}};
+
+typedef struct {
+  const char *key;
+  int cat;
+} CatMap;
+
+static const CatMap CAT_MAP[] = {
+    {"Development", SEC_DEV},
+    {"IDE", SEC_DEV},
+    {"Debugger", SEC_DEV},
+    {"RevisionControl", SEC_DEV},
+    {"WebDevelopment", SEC_DEV},
+    {"GUIDesigner", SEC_DEV},
+    {"Building", SEC_DEV},
+    {"Profiling", SEC_DEV},
+    {"Translation", SEC_DEV},
+
+    {"Education", SEC_EDU},
+    {"Science", SEC_EDU},
+    {"Math", SEC_EDU},
+    {"Astronomy", SEC_EDU},
+    {"Chemistry", SEC_EDU},
+    {"Physics", SEC_EDU},
+    {"Biology", SEC_EDU},
+    {"Languages", SEC_EDU},
+    {"Geography", SEC_EDU},
+    {"ArtificialIntelligence", SEC_EDU},
+
+    {"Game", SEC_GAMES},
+    {"ArcadeGame", SEC_GAMES},
+    {"BoardGame", SEC_GAMES},
+    {"CardGame", SEC_GAMES},
+    {"StrategyGame", SEC_GAMES},
+    {"LogicGame", SEC_GAMES},
+    {"RolePlaying", SEC_GAMES},
+    {"Simulation", SEC_GAMES},
+    {"SportsGame", SEC_GAMES},
+    {"ActionGame", SEC_GAMES},
+    {"AdventureGame", SEC_GAMES},
+    {"BlocksGame", SEC_GAMES},
+    {"KidsGame", SEC_GAMES},
+
+    {"Graphics", SEC_GRAPHICS},
+    {"2DGraphics", SEC_GRAPHICS},
+    {"3DGraphics", SEC_GRAPHICS},
+    {"RasterGraphics", SEC_GRAPHICS},
+    {"VectorGraphics", SEC_GRAPHICS},
+    {"Photography", SEC_GRAPHICS},
+    {"Scanning", SEC_GRAPHICS},
+    {"OCR", SEC_GRAPHICS},
+
+    {"Documentation", SEC_HELP},
+    {"Help", SEC_HELP},
+
+    {"Network", SEC_INTERNET},
+    {"WebBrowser", SEC_INTERNET},
+    {"Email", SEC_INTERNET},
+    {"Chat", SEC_INTERNET},
+    {"InstantMessaging", SEC_INTERNET},
+    {"IRCClient", SEC_INTERNET},
+    {"FileTransfer", SEC_INTERNET},
+    {"P2P", SEC_INTERNET},
+    {"News", SEC_INTERNET},
+    {"RemoteAccess", SEC_INTERNET},
+    {"Telephony", SEC_INTERNET},
+    {"VideoConference", SEC_INTERNET},
+    {"Feed", SEC_INTERNET},
+
+    {"AudioVideo", SEC_MULTIMEDIA},
+    {"Audio", SEC_MULTIMEDIA},
+    {"Video", SEC_MULTIMEDIA},
+    {"Player", SEC_MULTIMEDIA},
+    {"Recorder", SEC_MULTIMEDIA},
+    {"Music", SEC_MULTIMEDIA},
+    {"Midi", SEC_MULTIMEDIA},
+    {"Mixer", SEC_MULTIMEDIA},
+    {"Sequencer", SEC_MULTIMEDIA},
+    {"Tuner", SEC_MULTIMEDIA},
+    {"TV", SEC_MULTIMEDIA},
+    {"DiscBurning", SEC_MULTIMEDIA},
+    {"AudioVideoEditing", SEC_MULTIMEDIA},
+
+    {"Office", SEC_OFFICE},
+    {"WordProcessor", SEC_OFFICE},
+    {"Spreadsheet", SEC_OFFICE},
+    {"Presentation", SEC_OFFICE},
+    {"Calendar", SEC_OFFICE},
+    {"ContactManagement", SEC_OFFICE},
+    {"Database", SEC_OFFICE},
+    {"Dictionary", SEC_OFFICE},
+    {"Finance", SEC_OFFICE},
+    {"Publishing", SEC_OFFICE},
+    {"ProjectManagement", SEC_OFFICE},
+
+    {"System", SEC_SYSTEM},
+    {"Settings", SEC_SETTINGS},
+    {"DesktopSettings", SEC_SETTINGS},
+    {"HardwareSettings", SEC_SETTINGS},
+    {"PackageManager", SEC_SYSTEM},
+    {"Monitor", SEC_SYSTEM},
+    {"Security", SEC_SYSTEM},
+    {"Emulator", SEC_SYSTEM},
+    {"FileManager", SEC_SYSTEM},
+    {"FileSystem", SEC_SYSTEM},
+    {"TerminalEmulator", SEC_SYSTEM},
+
+    {"Utility", SEC_UTILITIES},
+    {"Accessibility", SEC_UTILITIES},
+    {"Archiving", SEC_UTILITIES},
+    {"Compression", SEC_UTILITIES},
+    {"Calculator", SEC_UTILITIES},
+    {"Clock", SEC_UTILITIES},
+    {"TextEditor", SEC_UTILITIES},
+    {"Maps", SEC_UTILITIES},
+    {"TextTools", SEC_UTILITIES},
+    {"FileTools", SEC_UTILITIES},
+};
+
+/* ---------------- data ---------------- */
+typedef struct {
+  char name[NAME_LEN];
+  char exec[EXEC_LEN];
+  char icon[ICON_LEN];
+  char id[ID_LEN]; /* .desktop file name without the suffix */
+  int terminal;
+  unsigned cats; /* bitmask of 1 << SEC_* */
+  int fav;       /* 0 = not a favorite, otherwise its position */
+  GdkPixbuf *pixbuf;
+  int icon_loaded;
+} AppEntry;
+
+typedef struct {
+  double x, y, w, h;
+} Rect;
+
+/* ids of clickable things (see hit_ui) */
+enum {
+  UI_NONE = 0,
+  UI_TAB0 = 1, /* Applications */
+  UI_TAB1 = 2, /* Places */
+  UI_POW0 = 3, /* 3..5 */
+  UI_CHEV = 6,
+  UI_CONF = 7,
+  UI_PIN = 8,
+  UI_SIDE0 = 100
+};
+
+static AppEntry g_apps[MAX_APPS];
+static int g_app_count = 0;
+
+static int g_filtered[MAX_APPS];
+static int g_filtered_count = 0;
+
+static char g_search[SEARCH_LEN] = {0};
+static int g_search_len = 0;
+static int g_selected = 0;   /* index into g_filtered[] */
+static int g_scroll_row = 0; /* topmost visible row */
+static int g_sec = SEC_FAV;
+static int g_pre_sec = SEC_FAV; /* section to return to when search is cleared */
+static int g_mode = 0;          /* 0 = Applications, 1 = Places */
+static int g_sec_visible[SEC_COUNT];
+static int g_pinned = 0;
+static int g_leave_alt = 0; /* chevron: show Lock / Log Out instead */
+static int g_hov = UI_NONE;
+
+static char g_user_name[128];
+static char g_login[64];
+static GdkPixbuf *g_avatar;
+static GdkPixbuf *g_side_pb[SEC_COUNT];
+static int g_side_tried[SEC_COUNT];
+
+/* hit rectangles, filled in while drawing */
+static Rect g_r_tab[2], g_r_pow[3], g_r_chev, g_r_conf, g_r_pin;
+static Rect g_r_side[SEC_COUNT];
+static int g_pow_n = 3;
+
+static xcb_connection_t *conn;
+static xcb_screen_t *screen;
+static xcb_window_t win;
+static cairo_surface_t *surface;
+static cairo_t *cr;
+static int g_have_alpha = 0;
+static xcb_window_t g_prev_focus = XCB_NONE; /* focus owner before we opened */
+static int g_launched = 0;                   /* an app was started */
+
+/* panel position on screen */
+static int g_px = 0, g_py = 0, g_pw = PANEL_W, g_ph = PANEL_H; /* window-local */
+static int g_wx, g_wy;  /* window position on screen */
+static int g_dirty = 0; /* redraw needed after current event batch */
+
+/* ---------------------------------------------------------------- */
+/* Icons                                                             */
+/* ---------------------------------------------------------------- */
+
+static GdkPixbuf *theme_icon_strict(const char *name, int size) {
+  if (!name || !name[0])
+    return NULL;
+  GdkScreen *gscreen = gdk_screen_get_default();
+  if (!gscreen)
+    return NULL;
+  GtkIconTheme *theme = gtk_icon_theme_get_for_screen(gscreen);
+  if (!theme)
+    return NULL;
+  GError *error = NULL;
+  GdkPixbuf *pb = gtk_icon_theme_load_icon(theme, name, size,
+                                           GTK_ICON_LOOKUP_FORCE_SIZE, &error);
+  if (error)
+    g_error_free(error);
+  return pb;
+}
+
+static GdkPixbuf *load_theme_icon(const char *icon_name, int size,
+                                  const char *fallback) {
+  GdkPixbuf *pixbuf = NULL;
+
+  if (icon_name && icon_name[0] == '/') {
+    GError *error = NULL;
+    pixbuf =
+        gdk_pixbuf_new_from_file_at_scale(icon_name, size, size, TRUE, &error);
+    if (error)
+      g_error_free(error);
+  } else {
+    pixbuf = theme_icon_strict(icon_name, size);
+  }
+  if (!pixbuf && fallback)
+    pixbuf = theme_icon_strict(fallback, size);
+  return pixbuf;
+}
+
+static void ensure_app_icon(AppEntry *app) {
+  if (!app || app->icon_loaded)
+    return;
+  int place = (app->cats >> SEC_PLACES) & 1u;
+  app->pixbuf = load_theme_icon(app->icon, ICON,
+                                place ? "folder" : "application-x-executable");
+  app->icon_loaded = 1;
+}
+
+static void free_app_icons(void) {
+  for (int i = 0; i < g_app_count; i++) {
+    if (g_apps[i].pixbuf) {
+      g_object_unref(g_apps[i].pixbuf);
+      g_apps[i].pixbuf = NULL;
+    }
+  }
+}
+
+/* ---------------------------------------------------------------- */
+/* .desktop parsing                                                  */
+/* ---------------------------------------------------------------- */
+
+static void trim_newline(char *s) {
+  size_t n = strlen(s);
+  while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' ||
+                   s[n - 1] == '\t')) {
+    s[--n] = '\0';
+  }
+}
+
+static void clean_exec(const char *raw, char *out, size_t out_size) {
+  size_t oi = 0;
+  for (size_t i = 0; raw[i] != '\0' && oi + 1 < out_size; i++) {
+    if (raw[i] == '%' && raw[i + 1] != '\0') {
+      char c = raw[i + 1];
+      if (c == '%') {
+        out[oi++] = '%';
+        i++;
+        continue;
+      }
+      if (strchr("fFuUick", c)) {
+        i++;
+        continue;
+      }
+    }
+    out[oi++] = raw[i];
+  }
+  out[oi] = '\0';
+  trim_newline(out);
+}
+
+static int app_exists(const char *name) {
+  for (int i = 0; i < g_app_count; i++) {
+    if (strcmp(g_apps[i].name, name) == 0)
+      return 1;
+  }
+  return 0;
+}
+
+static unsigned parse_categories(const char *raw) {
+  char buf[512];
+  snprintf(buf, sizeof(buf), "%s", raw);
+  unsigned mask = 0;
+  char *save = NULL;
+  for (char *tok = strtok_r(buf, ";", &save); tok;
+       tok = strtok_r(NULL, ";", &save)) {
+    for (size_t i = 0; i < sizeof(CAT_MAP) / sizeof(CAT_MAP[0]); i++) {
+      if (strcmp(tok, CAT_MAP[i].key) == 0) {
+        mask |= 1u << CAT_MAP[i].cat;
+        break;
+      }
+    }
+  }
+  return mask;
+}
+
+static int parse_desktop_file(const char *path, AppEntry *out) {
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return 0;
+
+  char line[1024];
+  char name[NAME_LEN] = {0};
+  char exec_raw[EXEC_LEN] = {0};
+  char icon[ICON_LEN] = {0};
+  char type_buf[64] = {0};
+  char cats_raw[512] = {0};
+  int terminal = 0, no_display = 0, hidden = 0;
+  int in_entry = 0;
+
+  while (fgets(line, sizeof(line), f)) {
+    trim_newline(line);
+    if (line[0] == '\0' || line[0] == '#')
+      continue;
+
+    if (line[0] == '[') {
+      in_entry = (strcmp(line, "[Desktop Entry]") == 0);
+      continue;
+    }
+    if (!in_entry)
+      continue;
+
+    char *eq = strchr(line, '=');
+    if (!eq)
+      continue;
+    *eq = '\0';
+    char *key = line;
+    char *val = eq + 1;
+
+    if (strcmp(key, "Name") == 0 && name[0] == '\0') {
+      snprintf(name, sizeof(name), "%s", val);
+    } else if (strcmp(key, "Exec") == 0) {
+      snprintf(exec_raw, sizeof(exec_raw), "%s", val);
+    } else if (strcmp(key, "Icon") == 0) {
+      snprintf(icon, sizeof(icon), "%s", val);
+    } else if (strcmp(key, "Categories") == 0) {
+      snprintf(cats_raw, sizeof(cats_raw), "%s", val);
+    } else if (strcmp(key, "Terminal") == 0) {
+      terminal = (strcasecmp(val, "true") == 0);
+    } else if (strcmp(key, "NoDisplay") == 0) {
+      no_display = (strcasecmp(val, "true") == 0);
+    } else if (strcmp(key, "Hidden") == 0) {
+      hidden = (strcasecmp(val, "true") == 0);
+    } else if (strcmp(key, "Type") == 0) {
+      snprintf(type_buf, sizeof(type_buf), "%s", val);
+    }
+  }
+  fclose(f);
+
+  if (no_display || hidden)
+    return 0;
+  if (type_buf[0] != '\0' && strcmp(type_buf, "Application") != 0)
+    return 0;
+  if (name[0] == '\0' || exec_raw[0] == '\0')
+    return 0;
+
+  memset(out, 0, sizeof(*out));
+  snprintf(out->name, sizeof(out->name), "%s", name);
+  snprintf(out->icon, sizeof(out->icon), "%s", icon);
+  out->terminal = terminal;
+  out->cats = parse_categories(cats_raw);
+  clean_exec(exec_raw, out->exec, sizeof(out->exec));
+  return 1;
+}
+
+static void scan_dir(const char *dirpath) {
+  DIR *d = opendir(dirpath);
+  if (!d)
+    return;
+
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    size_t len = strlen(ent->d_name);
+    if (len < 9 || strcmp(ent->d_name + len - 8, ".desktop") != 0)
+      continue;
+    if (g_app_count >= MAX_APPS)
+      break;
+
+    char full[1024];
+    snprintf(full, sizeof(full), "%s/%s", dirpath, ent->d_name);
+
+    AppEntry tmp;
+    if (parse_desktop_file(full, &tmp) && !app_exists(tmp.name)) {
+      snprintf(tmp.id, sizeof(tmp.id), "%.*s", (int)(len - 8), ent->d_name);
+      g_apps[g_app_count++] = tmp;
+    }
+  }
+  closedir(d);
+}
+
+static int cmp_apps(const void *a, const void *b) {
+  const AppEntry *aa = a, *bb = b;
+  return strcasecmp(aa->name, bb->name);
+}
+
+static void discover_apps(void) {
+  char path[1024];
+  const char *home = getenv("HOME");
+  const char *xdg_data_home = getenv("XDG_DATA_HOME");
+
+  if (xdg_data_home && xdg_data_home[0]) {
+    snprintf(path, sizeof(path), "%s/applications", xdg_data_home);
+    scan_dir(path);
+  } else if (home) {
+    snprintf(path, sizeof(path), "%s/.local/share/applications", home);
+    scan_dir(path);
+  }
+
+  const char *data_dirs = getenv("XDG_DATA_DIRS");
+  if (!data_dirs || !data_dirs[0])
+    data_dirs = "/usr/local/share:/usr/share";
+
+  char dirs_copy[1024];
+  snprintf(dirs_copy, sizeof(dirs_copy), "%s", data_dirs);
+  char *saveptr = NULL;
+  char *tok = strtok_r(dirs_copy, ":", &saveptr);
+  while (tok) {
+    snprintf(path, sizeof(path), "%s/applications", tok);
+    scan_dir(path);
+    tok = strtok_r(NULL, ":", &saveptr);
+  }
+
+  scan_dir("/usr/share/applications");
+  scan_dir("/usr/local/share/applications");
+
+  qsort(g_apps, (size_t)g_app_count, sizeof(AppEntry), cmp_apps);
+}
+
+/* ---------------------------------------------------------------- */
+/* Filtering / scrolling                                             */
+/* ---------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------- */
+/* User, favorites, places                                           */
+/* ---------------------------------------------------------------- */
+
+static GdkPixbuf *load_avatar_file(const char *path) {
+  GError *err = NULL;
+  GdkPixbuf *pb = gdk_pixbuf_new_from_file(path, &err);
+  if (err)
+    g_error_free(err);
+  if (!pb)
+    return NULL;
+  return pb; /* squared + scaled by caller */
+}
+
+static GdkPixbuf *square_scaled(GdkPixbuf *pb, int size) {
+  if (!pb)
+    return NULL;
+  int w = gdk_pixbuf_get_width(pb), h = gdk_pixbuf_get_height(pb);
+  int s = w < h ? w : h;
+  GdkPixbuf *sub = gdk_pixbuf_new_subpixbuf(pb, (w - s) / 2, (h - s) / 2, s, s);
+  GdkPixbuf *out = gdk_pixbuf_scale_simple(sub, size, size, GDK_INTERP_HYPER);
+  g_object_unref(sub);
+  g_object_unref(pb);
+  return out;
+}
+
+static void load_user_info(void) {
+  struct passwd *pw = getpwuid(getuid());
+  const char *login = (pw && pw->pw_name) ? pw->pw_name : getenv("USER");
+  if (!login || !login[0])
+    login = "user";
+  snprintf(g_login, sizeof(g_login), "%s", login);
+
+  /* display name: full name from the account, else the login */
+  g_user_name[0] = '\0';
+  if (pw && pw->pw_gecos && pw->pw_gecos[0]) {
+    snprintf(g_user_name, sizeof(g_user_name), "%s", pw->pw_gecos);
+    char *comma = strchr(g_user_name, ',');
+    if (comma)
+      *comma = '\0';
+    trim_newline(g_user_name);
+  }
+  if (!g_user_name[0])
+    snprintf(g_user_name, sizeof(g_user_name), "%s", g_login);
+
+  /* profile picture */
+  const char *home = getenv("HOME");
+  if (!home && pw)
+    home = pw->pw_dir;
+  char path[1024];
+  GdkPixbuf *pb = NULL;
+
+  if (home) {
+    snprintf(path, sizeof(path), "%s/.face.icon", home);
+    pb = load_avatar_file(path);
+    if (!pb) {
+      snprintf(path, sizeof(path), "%s/.face", home);
+      pb = load_avatar_file(path);
+    }
+  }
+  if (!pb) {
+    snprintf(path, sizeof(path), "/var/lib/AccountsService/icons/%s", g_login);
+    pb = load_avatar_file(path);
+  }
+  if (!pb) {
+    snprintf(path, sizeof(path), "/var/lib/AccountsService/users/%s", g_login);
+    FILE *f = fopen(path, "r");
+    if (f) {
+      char line[1024];
+      while (fgets(line, sizeof(line), f)) {
+        trim_newline(line);
+        if (strncmp(line, "Icon=", 5) == 0) {
+          pb = load_avatar_file(line + 5);
+          break;
+        }
+      }
+      fclose(f);
+    }
+  }
+  if (!pb)
+    pb = theme_icon_strict("avatar-default", 64);
+  if (!pb)
+    pb = theme_icon_strict("user-identity", 64);
+
+  g_avatar = square_scaled(pb, AVATAR_R * 2);
+}
+
+static void free_ui_icons(void) {
+  if (g_avatar) {
+    g_object_unref(g_avatar);
+    g_avatar = NULL;
+  }
+  for (int i = 0; i < SEC_COUNT; i++) {
+    if (g_side_pb[i]) {
+      g_object_unref(g_side_pb[i]);
+      g_side_pb[i] = NULL;
+    }
+  }
+}
+
+static void fav_path(char *out, size_t n) {
+  const char *xdg = getenv("XDG_CONFIG_HOME");
+  const char *home = getenv("HOME");
+  out[0] = '\0';
+  if (xdg && xdg[0])
+    snprintf(out, n, "%s/applauncher/favorites", xdg);
+  else if (home)
+    snprintf(out, n, "%s/.config/applauncher/favorites", home);
+}
+
+static int find_app_id(const char *tok) {
+  for (int i = 0; i < g_app_count; i++) {
+    if (strcasecmp(g_apps[i].id, tok) == 0 ||
+        strcasecmp(g_apps[i].name, tok) == 0)
+      return i;
+  }
+  return -1;
+}
+
+static void load_favorites(void) {
+  char path[1024];
+  fav_path(path, sizeof(path));
+  int rank = 0;
+  FILE *f = path[0] ? fopen(path, "r") : NULL;
+  if (f) {
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+      trim_newline(line);
+      if (!line[0] || line[0] == '#')
+        continue;
+      int i = find_app_id(line);
+      if (i >= 0 && !g_apps[i].fav)
+        g_apps[i].fav = ++rank;
+    }
+    fclose(f);
+    return;
+  }
+
+  /* first run: the same four favorites KDE Neon ships with */
+  static const char *defs[] = {"firefox",
+                               "org.mozilla.firefox",
+                               "firefox-developer-edition",
+                               "com.vscodium.codium-insiders",
+                               "com.vscodium.codium",
+                               "gtkfm",
+                               "thunar",
+                               "waypaper",
+                               "virt-manager",
+                               // "Blender",
+                               NULL};
+  for (int k = 0; defs[k]; k++) {
+    int i = find_app_id(defs[k]);
+    if (i >= 0 && !g_apps[i].fav)
+      g_apps[i].fav = ++rank;
+  }
+  for (int i = 0; i < g_app_count && rank == 0; i++) { /* nothing matched */
+    if (i >= 4)
+      break;
+    g_apps[i].fav = ++rank;
+  }
+}
+
+static void save_favorites(void) {
+  char path[1024];
+  fav_path(path, sizeof(path));
+  if (!path[0])
+    return;
+  char dir[1024];
+  snprintf(dir, sizeof(dir), "%s", path);
+  char *slash = strrchr(dir, '/');
+  if (slash) {
+    *slash = '\0';
+    mkdir(dir, 0755);
+  }
+  FILE *f = fopen(path, "w");
+  if (!f)
+    return;
+  int max = 0;
+  for (int i = 0; i < g_app_count; i++)
+    if (g_apps[i].fav > max)
+      max = g_apps[i].fav;
+  for (int r = 1; r <= max; r++)
+    for (int i = 0; i < g_app_count; i++)
+      if (g_apps[i].fav == r && g_apps[i].id[0])
+        fprintf(f, "%s\n", g_apps[i].id);
+  fclose(f);
+}
+
+static void add_place(const char *label, const char *icon, const char *path) {
+  struct stat st;
+  if (g_app_count >= MAX_APPS)
+    return;
+  if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode))
+    return;
+  AppEntry *a = &g_apps[g_app_count];
+  memset(a, 0, sizeof(*a));
+  snprintf(a->name, sizeof(a->name), "%s", label);
+  snprintf(a->icon, sizeof(a->icon), "%s", icon);
+  char *q = g_shell_quote(path);
+  snprintf(a->exec, sizeof(a->exec), "xdg-open %s", q);
+  g_free(q);
+  a->cats = 1u << SEC_PLACES;
+  g_app_count++;
+}
+
+static void add_places(void) {
+  const char *home = getenv("HOME");
+  char p[1024];
+  if (home) {
+    add_place("Home", "user-home", home);
+    snprintf(p, sizeof(p), "%s/Desktop", home);
+    add_place("Desktop", "user-desktop", p);
+    snprintf(p, sizeof(p), "%s/Documents", home);
+    add_place("Documents", "folder-documents", p);
+    snprintf(p, sizeof(p), "%s/Downloads", home);
+    add_place("Downloads", "folder-download", p);
+    snprintf(p, sizeof(p), "%s/Music", home);
+    add_place("Music", "folder-music", p);
+    snprintf(p, sizeof(p), "%s/Pictures", home);
+    add_place("Pictures", "folder-pictures", p);
+    snprintf(p, sizeof(p), "%s/Videos", home);
+    add_place("Videos", "folder-videos", p);
+  }
+  add_place("Computer", "computer", "/");
+}
+
+static void compute_sections(void) {
+  for (int s = 0; s < SEC_COUNT; s++)
+    g_sec_visible[s] = 0;
+  g_sec_visible[SEC_FAV] = 1;
+  g_sec_visible[SEC_ALL] = 1;
+  for (int i = 0; i < g_app_count; i++) {
+    if ((g_apps[i].cats >> SEC_PLACES) & 1u)
+      continue;
+    for (int s = SEC_DEV; s < SEC_COUNT; s++)
+      if (g_apps[i].cats & (1u << s))
+        g_sec_visible[s] = 1;
+  }
+}
+
+/* ---------------------------------------------------------------- */
+/* Filtering / scrolling                                             */
+/* ---------------------------------------------------------------- */
+
+static int cmp_fav(const void *a, const void *b) {
+  return g_apps[*(const int *)a].fav - g_apps[*(const int *)b].fav;
+}
+
+static void recompute_filter(void) {
+  char needle[SEARCH_LEN];
+  for (int k = 0; k < g_search_len; k++)
+    needle[k] = (char)tolower((unsigned char)g_search[k]);
+  needle[g_search_len] = '\0';
+
+  g_filtered_count = 0;
+  for (int i = 0; i < g_app_count; i++) {
+    AppEntry *a = &g_apps[i];
+    int place = (a->cats >> SEC_PLACES) & 1u;
+
+    if (g_mode == 1) {
+      if (!place)
+        continue;
+    } else {
+      if (place)
+        continue;
+      if (g_search_len == 0) {
+        if (g_sec == SEC_FAV) {
+          if (!a->fav)
+            continue;
+        } else if (g_sec >= SEC_DEV && !(a->cats & (1u << g_sec))) {
+          continue;
+        }
+      } else {
+        char hay[NAME_LEN];
+        size_t hn = strlen(a->name);
+        for (size_t k = 0; k < hn && k < sizeof(hay) - 1; k++)
+          hay[k] = (char)tolower((unsigned char)a->name[k]);
+        hay[hn < sizeof(hay) - 1 ? hn : sizeof(hay) - 1] = '\0';
+        if (!strstr(hay, needle))
+          continue;
+      }
+    }
+    g_filtered[g_filtered_count++] = i;
+  }
+  if (g_mode == 0 && g_search_len == 0 && g_sec == SEC_FAV)
+    qsort(g_filtered, (size_t)g_filtered_count, sizeof(int), cmp_fav);
+  g_selected = 0;
+  g_scroll_row = 0;
+}
+
+static void clamp_scroll(void) {
+  int max_row = 0;
+  if (g_filtered_count > 0) {
+    int total_rows = (g_filtered_count + COLS - 1) / COLS;
+    max_row = total_rows - VROWS;
+    if (max_row < 0)
+      max_row = 0;
+  }
+  if (g_scroll_row < 0)
+    g_scroll_row = 0;
+  if (g_scroll_row > max_row)
+    g_scroll_row = max_row;
+}
+
+static void ensure_selected_visible(void) {
+  int sel_row = g_selected / COLS;
+  if (sel_row < g_scroll_row)
+    g_scroll_row = sel_row;
+  else if (sel_row >= g_scroll_row + VROWS)
+    g_scroll_row = sel_row - VROWS + 1;
+  clamp_scroll();
+}
+
+static void set_section(int s) {
+  g_mode = 0;
+  g_sec = s;
+  g_search_len = 0;
+  g_search[0] = '\0';
+  recompute_filter();
+}
+
+static void step_section(int dir) {
+  if (g_mode == 1) {
+    set_section(g_sec);
+    return;
+  }
+  int s = g_sec;
+  for (int n = 0; n < SEC_COUNT; n++) {
+    s += dir;
+    if (s < 0)
+      s = SEC_COUNT - 1;
+    if (s >= SEC_COUNT)
+      s = 0;
+    if (g_sec_visible[s])
+      break;
+  }
+  set_section(s);
+}
+
+static void toggle_favorite(int idx) {
+  AppEntry *a = &g_apps[idx];
+  if (a->fav) {
+    a->fav = 0;
+  } else {
+    int max = 0;
+    for (int i = 0; i < g_app_count; i++)
+      if (g_apps[i].fav > max)
+        max = g_apps[i].fav;
+    a->fav = max + 1;
+  }
+  save_favorites();
+
+  int keep = g_selected;
+  recompute_filter();
+  if (keep >= g_filtered_count)
+    keep = g_filtered_count - 1;
+  g_selected = keep < 0 ? 0 : keep;
+  ensure_selected_visible();
+}
+
+/* ---------------------------------------------------------------- */
+/* Launching                                                         */
+/* ---------------------------------------------------------------- */
+
+static void launch_app(const AppEntry *app) {
+  g_launched = 1;
+  pid_t pid = fork();
+  if (pid == 0) {
+    setsid();
+    if (app->terminal) {
+      execlp("wezterm", "wezterm", "start", "--", "sh", "-c", app->exec, NULL);
+      execlp("konsole", "konsole", "-e", "sh", "-c", app->exec, NULL);
+      execlp("xterm", "xterm", "-e", "sh", "-c", app->exec, NULL);
+    } else {
+      execlp("sh", "sh", "-c", app->exec, NULL);
+    }
+    _exit(127);
+  }
+}
+
+static void run_cmd(const char *cmd) {
+  g_launched = 1;
+  pid_t pid = fork();
+  if (pid == 0) {
+    setsid();
+    execlp("sh", "sh", "-c", cmd, NULL);
+    _exit(127);
+  }
+}
+
+/* ---------------------------------------------------------------- */
+/* Window / compositor support                                       */
+/* ---------------------------------------------------------------- */
+
+static xcb_visualtype_t *find_argb_visual(xcb_depth_t **out_depth) {
+  xcb_depth_iterator_t di = xcb_screen_allowed_depths_iterator(screen);
+
+  for (; di.rem; xcb_depth_next(&di)) {
+    if (di.data->depth != 32)
+      continue;
+
+    xcb_visualtype_iterator_t vi = xcb_depth_visuals_iterator(di.data);
+    for (; vi.rem; xcb_visualtype_next(&vi)) {
+      if (vi.data->_class == XCB_VISUAL_CLASS_TRUE_COLOR ||
+          vi.data->_class == XCB_VISUAL_CLASS_DIRECT_COLOR) {
+        if (out_depth)
+          *out_depth = di.data;
+        return vi.data;
+      }
+    }
+  }
+
+  if (out_depth)
+    *out_depth = NULL;
+  return NULL;
+}
+
+/* Blur only the panel, with rounded corners (built from 1px-high rects). */
+static void set_blur_region(void) {
+  const char *prop_name = "_KDE_NET_WM_BLUR_BEHIND_REGION";
+  xcb_intern_atom_cookie_t pc =
+      xcb_intern_atom(conn, 0, (uint16_t)strlen(prop_name), prop_name);
+  xcb_intern_atom_reply_t *pr = xcb_intern_atom_reply(conn, pc, NULL);
+  if (!pr)
+    return;
+  xcb_atom_t prop = pr->atom;
+  free(pr);
+
+  int r = PANEL_R;
+  int nrects = 2 * r + 1;
+  uint32_t *reg = malloc(sizeof(uint32_t) * 4 * (size_t)nrects);
+  if (!reg)
+    return;
+
+  int n = 0;
+  for (int i = 0; i < r; i++) {
+    double dy = r - i - 0.5;
+    int inset = (int)lround(r - sqrt((double)r * r - dy * dy));
+    /* top row i */
+    reg[n * 4 + 0] = (uint32_t)(g_px + inset);
+    reg[n * 4 + 1] = (uint32_t)(g_py + i);
+    reg[n * 4 + 2] = (uint32_t)(g_pw - 2 * inset);
+    reg[n * 4 + 3] = 1;
+    n++;
+    /* mirrored bottom row */
+    reg[n * 4 + 0] = (uint32_t)(g_px + inset);
+    reg[n * 4 + 1] = (uint32_t)(g_py + g_ph - 1 - i);
+    reg[n * 4 + 2] = (uint32_t)(g_pw - 2 * inset);
+    reg[n * 4 + 3] = 1;
+    n++;
+  }
+  reg[n * 4 + 0] = (uint32_t)g_px;
+  reg[n * 4 + 1] = (uint32_t)(g_py + r);
+  reg[n * 4 + 2] = (uint32_t)g_pw;
+  reg[n * 4 + 3] = (uint32_t)(g_ph - 2 * r);
+  n++;
+
+  xcb_change_property(conn, XCB_PROP_MODE_REPLACE, win, prop, XCB_ATOM_CARDINAL,
+                      32, (uint32_t)(n * 4), reg);
+  free(reg);
+}
+
+static void compute_layout(void) {
+  int sh = screen->height_in_pixels;
+  g_px = 0;
+  g_py = 0;
+  g_wx = LAUNCH_MARGIN_X;
+  g_wy = sh - g_ph - LAUNCH_MARGIN_BOTTOM;
+  if (g_wy < 0)
+    g_wy = 0;
+}
+
+/* ---------------------------------------------------------------- */
+/* Drawing helpers                                                   */
+/* ---------------------------------------------------------------- */
+
+static void rounded_rect(cairo_t *c, double x, double y, double w, double h,
+                         double r) {
+  cairo_new_sub_path(c);
+  cairo_arc(c, x + w - r, y + r, r, -M_PI_2, 0);
+  cairo_arc(c, x + w - r, y + h - r, r, 0, M_PI_2);
+  cairo_arc(c, x + r, y + h - r, r, M_PI_2, M_PI);
+  cairo_arc(c, x + r, y + r, r, M_PI, 3 * M_PI_2);
+  cairo_close_path(c);
+}
+
+static void set_font(cairo_t *c, double size, int bold) {
+  cairo_select_font_face(c, "Sans", CAIRO_FONT_SLANT_NORMAL,
+                         bold ? CAIRO_FONT_WEIGHT_BOLD
+                              : CAIRO_FONT_WEIGHT_NORMAL);
+  cairo_set_font_size(c, size);
+}
+
+static void name_to_color(const char *name, double *r, double *g, double *b) {
+  unsigned long hash = 5381;
+  for (const unsigned char *p = (const unsigned char *)name; *p; p++)
+    hash = hash * 33 + *p;
+  double hue = (double)(hash % 360);
+  double s = 0.55, v = 0.75;
+  double c = v * s;
+  double x = c * (1 - fabs(fmod(hue / 60.0, 2) - 1));
+  double m = v - c;
+  double rr, gg, bb;
+  if (hue < 60) {
+    rr = c; gg = x; bb = 0;
+  } else if (hue < 120) {
+    rr = x; gg = c; bb = 0;
+  } else if (hue < 180) {
+    rr = 0; gg = c; bb = x;
+  } else if (hue < 240) {
+    rr = 0; gg = x; bb = c;
+  } else if (hue < 300) {
+    rr = x; gg = 0; bb = c;
+  } else {
+    rr = c; gg = 0; bb = x;
+  }
+  *r = rr + m;
+  *g = gg + m;
+  *b = bb + m;
+}
+
+/* Copy `text` into buf, trimming with "..." until it fits max_w. */
+static void ellipsize_fit(cairo_t *c, const char *text, double max_w, char *buf,
+                          size_t bufsz) {
+  snprintf(buf, bufsz, "%s", text);
+  cairo_text_extents_t e;
+  cairo_text_extents(c, buf, &e);
+  if (e.x_advance <= max_w)
+    return;
+
+  size_t len = strlen(buf);
+  while (len > 1) {
+    len--;
+    while (len > 1 && ((unsigned char)buf[len] & 0xC0) == 0x80)
+      len--; /* don't cut inside a UTF-8 sequence */
+    char tmp[NAME_LEN + 4];
+    snprintf(tmp, sizeof(tmp), "%.*s...", (int)len, text);
+    cairo_text_extents(c, tmp, &e);
+    if (e.x_advance <= max_w || len == 1) {
+      snprintf(buf, bufsz, "%s", tmp);
+      return;
+    }
+  }
+}
+
+static void show_centered(cairo_t *c, const char *s, double cx, double y,
+                          double alpha) {
+  cairo_text_extents_t e;
+  cairo_text_extents(c, s, &e);
+  double x = cx - e.x_advance / 2.0;
+
+  cairo_set_source_rgba(c, 0, 0, 0, 0.35 * alpha); /* soft shadow */
+  cairo_move_to(c, x + 0.5, y + 1.0);
+  cairo_show_text(c, s);
+
+  cairo_set_source_rgba(c, 1, 1, 1, alpha);
+  cairo_move_to(c, x, y);
+  cairo_show_text(c, s);
+}
+
+/* Two-line wrapped label, centered on cx. */
+static void draw_label(cairo_t *c, const char *name, double cx, double y1) {
+  const double maxw = COL_W - 6;
+  char buf[NAME_LEN + 4];
+  cairo_text_extents_t e;
+
+  cairo_text_extents(c, name, &e);
+  if (e.x_advance <= maxw) {
+    show_centered(c, name, cx, y1 + 6, 0.92);
+    return;
+  }
+
+  /* longest word-boundary prefix that fits on line 1 */
+  int best = -1;
+  size_t n = strlen(name);
+  for (size_t i = 1; i < n; i++) {
+    if (name[i] != ' ')
+      continue;
+    char tmp[NAME_LEN];
+    snprintf(tmp, sizeof(tmp), "%.*s", (int)i, name);
+    cairo_text_extents(c, tmp, &e);
+    if (e.x_advance <= maxw)
+      best = (int)i;
+    else
+      break;
+  }
+
+  if (best <= 0) { /* a single long word */
+    ellipsize_fit(c, name, maxw, buf, sizeof(buf));
+    show_centered(c, buf, cx, y1 + 6, 0.92);
+    return;
+  }
+
+  char l1[NAME_LEN];
+  snprintf(l1, sizeof(l1), "%.*s", best, name);
+  const char *rest = name + best;
+  while (*rest == ' ')
+    rest++;
+
+  ellipsize_fit(c, rest, maxw, buf, sizeof(buf));
+  show_centered(c, l1, cx, y1, 0.92);
+  show_centered(c, buf, cx, y1 + 14, 0.92);
+}
+
+/* ---------------------------------------------------------------- */
+/* Panel drawing (panel-local coordinates)                           */
+/* ---------------------------------------------------------------- */
+
+static void txt(cairo_t *c, const char *s, double x, double y, double a) {
+  cairo_set_source_rgba(c, 1, 1, 1, a);
+  cairo_move_to(c, x, y);
+  cairo_show_text(c, s);
+}
+
+static double txt_w(cairo_t *c, const char *s) {
+  cairo_text_extents_t e;
+  cairo_text_extents(c, s, &e);
+  return e.x_advance;
+}
+
+static void stroke_setup(cairo_t *c, double a) {
+  cairo_set_source_rgba(c, 1, 1, 1, a);
+  cairo_set_line_width(c, 1.5);
+  cairo_set_line_cap(c, CAIRO_LINE_CAP_ROUND);
+  cairo_set_line_join(c, CAIRO_LINE_JOIN_ROUND);
+}
+
+/* ---- small vector icons (centred on cx, cy) ---- */
+
+static void ic_search(cairo_t *c, double cx, double cy, double a) {
+  stroke_setup(c, a);
+  cairo_new_path(c);
+  cairo_arc(c, cx - 1.5, cy - 1.5, 5, 0, 2 * M_PI);
+  cairo_stroke(c);
+  cairo_move_to(c, cx + 2.2, cy + 2.2);
+  cairo_line_to(c, cx + 7, cy + 7);
+  cairo_stroke(c);
+}
+
+static void ic_sliders(cairo_t *c, double cx, double cy, double a) {
+  stroke_setup(c, a);
+  cairo_set_line_width(c, 1.4);
+  cairo_new_path(c);
+  cairo_move_to(c, cx - 8, cy - 4);
+  cairo_line_to(c, cx + 8, cy - 4);
+  cairo_stroke(c);
+  cairo_move_to(c, cx - 8, cy + 4);
+  cairo_line_to(c, cx + 8, cy + 4);
+  cairo_stroke(c);
+  double kx[2] = {cx + 3, cx - 3}, ky[2] = {cy - 4, cy + 4};
+  for (int i = 0; i < 2; i++) {
+    cairo_new_path(c);
+    cairo_arc(c, kx[i], ky[i], 2.6, 0, 2 * M_PI);
+    cairo_set_source_rgba(c, 0.16, 0.18, 0.19, 1);
+    cairo_fill_preserve(c);
+    cairo_set_source_rgba(c, 1, 1, 1, a);
+    cairo_stroke(c);
+  }
+}
+
+static void ic_pin(cairo_t *c, double cx, double cy, double a, int on) {
+  cairo_save(c);
+  cairo_translate(c, cx, cy);
+  cairo_rotate(c, M_PI / 4);
+  if (on)
+    cairo_set_source_rgba(c, ACC_R, ACC_G, ACC_B, 1);
+  else
+    cairo_set_source_rgba(c, 1, 1, 1, a);
+  cairo_set_line_width(c, 1.5);
+  cairo_set_line_cap(c, CAIRO_LINE_CAP_ROUND);
+  cairo_set_line_join(c, CAIRO_LINE_JOIN_ROUND);
+  cairo_new_path(c);
+  cairo_move_to(c, -2.5, -8);
+  cairo_line_to(c, 2.5, -8);
+  cairo_line_to(c, 2.5, -1.5);
+  cairo_line_to(c, 5, 1.5);
+  cairo_line_to(c, -5, 1.5);
+  cairo_line_to(c, -2.5, -1.5);
+  cairo_close_path(c);
+  if (on)
+    cairo_fill_preserve(c);
+  cairo_stroke(c);
+  cairo_move_to(c, 0, 1.5);
+  cairo_line_to(c, 0, 8);
+  cairo_stroke(c);
+  cairo_restore(c);
+}
+
+static void ic_apps4(cairo_t *c, double cx, double cy, double a, int accent) {
+  double s = 6.5, g = 3, x0 = cx - (2 * s + g) / 2, y0 = cy - (2 * s + g) / 2;
+  for (int i = 0; i < 2; i++)
+    for (int j = 0; j < 2; j++) {
+      rounded_rect(c, x0 + i * (s + g), y0 + j * (s + g), s, s, 1.6);
+      if (accent)
+        cairo_set_source_rgba(c, ACC_R, ACC_G, ACC_B, 1);
+      else
+        cairo_set_source_rgba(c, 1, 1, 1, a);
+      cairo_fill(c);
+    }
+}
+
+static void ic_compass(cairo_t *c, double cx, double cy, double a) {
+  stroke_setup(c, a);
+  cairo_new_path(c);
+  cairo_arc(c, cx, cy, 8, 0, 2 * M_PI);
+  cairo_stroke(c);
+  cairo_save(c);
+  cairo_translate(c, cx, cy);
+  cairo_rotate(c, M_PI / 4);
+  cairo_new_path(c);
+  cairo_move_to(c, 0, -5);
+  cairo_line_to(c, 2.2, 0);
+  cairo_line_to(c, 0, 5);
+  cairo_line_to(c, -2.2, 0);
+  cairo_close_path(c);
+  cairo_set_source_rgba(c, 1, 1, 1, a);
+  cairo_fill(c);
+  cairo_restore(c);
+}
+
+static void ic_bookmark(cairo_t *c, double cx, double cy, double a) {
+  stroke_setup(c, a);
+  cairo_new_path(c);
+  cairo_move_to(c, cx - 5, cy - 7);
+  cairo_line_to(c, cx + 5, cy - 7);
+  cairo_line_to(c, cx + 5, cy + 7);
+  cairo_line_to(c, cx, cy + 3);
+  cairo_line_to(c, cx - 5, cy + 7);
+  cairo_close_path(c);
+  cairo_stroke(c);
+}
+
+static void ic_moon(cairo_t *c, double cx, double cy, double a) {
+  cairo_save(c);
+  cairo_new_path(c);
+  cairo_arc(c, cx + 4.2, cy - 2.6, 6.2, 0, 2 * M_PI);
+  cairo_rectangle(c, cx - 20, cy - 20, 40, 40);
+  cairo_set_fill_rule(c, CAIRO_FILL_RULE_EVEN_ODD);
+  cairo_clip(c);
+  cairo_new_path(c);
+  cairo_arc(c, cx, cy, 7.5, 0, 2 * M_PI);
+  cairo_set_source_rgba(c, 1, 1, 1, a);
+  cairo_fill(c);
+  cairo_restore(c);
+}
+
+static void ic_restart(cairo_t *c, double cx, double cy, double a) {
+  double r = 6.2, a0 = -M_PI * 0.35, a1 = M_PI * 1.55;
+  stroke_setup(c, a);
+  cairo_new_path(c);
+  cairo_arc(c, cx, cy, r, a0, a1);
+  cairo_stroke(c);
+  double px = cx + r * cos(a1), py = cy + r * sin(a1);
+  double tx = -sin(a1), ty = cos(a1), nx = cos(a1), ny = sin(a1);
+  cairo_new_path(c);
+  cairo_move_to(c, px + tx * 4.5, py + ty * 4.5);
+  cairo_line_to(c, px - tx * 0.5 + nx * 3.6, py - ty * 0.5 + ny * 3.6);
+  cairo_line_to(c, px - tx * 0.5 - nx * 3.6, py - ty * 0.5 - ny * 3.6);
+  cairo_close_path(c);
+  cairo_set_source_rgba(c, 1, 1, 1, a);
+  cairo_fill(c);
+}
+
+static void ic_power(cairo_t *c, double cx, double cy, double a) {
+  stroke_setup(c, a);
+  cairo_new_path(c);
+  cairo_arc(c, cx, cy + 0.5, 6.6, -M_PI / 2 + 0.6, 3 * M_PI / 2 - 0.6);
+  cairo_stroke(c);
+  cairo_move_to(c, cx, cy - 7.5);
+  cairo_line_to(c, cx, cy - 1);
+  cairo_stroke(c);
+}
+
+static void ic_lock(cairo_t *c, double cx, double cy, double a) {
+  stroke_setup(c, a);
+  rounded_rect(c, cx - 6, cy - 1, 12, 8.5, 1.8);
+  cairo_stroke(c);
+  cairo_new_path(c);
+  cairo_arc(c, cx, cy - 1, 3.8, M_PI, 2 * M_PI);
+  cairo_stroke(c);
+}
+
+static void ic_logout(cairo_t *c, double cx, double cy, double a) {
+  stroke_setup(c, a);
+  cairo_new_path(c);
+  cairo_move_to(c, cx + 1, cy - 6.5);
+  cairo_line_to(c, cx - 6, cy - 6.5);
+  cairo_line_to(c, cx - 6, cy + 6.5);
+  cairo_line_to(c, cx + 1, cy + 6.5);
+  cairo_stroke(c);
+  cairo_move_to(c, cx - 2, cy);
+  cairo_line_to(c, cx + 7, cy);
+  cairo_stroke(c);
+  cairo_move_to(c, cx + 4, cy - 3);
+  cairo_line_to(c, cx + 7, cy);
+  cairo_line_to(c, cx + 4, cy + 3);
+  cairo_stroke(c);
+}
+
+static void ic_chevron(cairo_t *c, double cx, double cy, double a, int left) {
+  stroke_setup(c, a);
+  cairo_new_path(c);
+  cairo_arc(c, cx, cy, 9.5, 0, 2 * M_PI);
+  cairo_set_line_width(c, 1.2);
+  cairo_stroke(c);
+  double d = left ? 1 : -1;
+  cairo_set_line_width(c, 1.6);
+  cairo_move_to(c, cx + 2 * d, cy - 4.5);
+  cairo_line_to(c, cx - 2.5 * d, cy);
+  cairo_line_to(c, cx + 2 * d, cy + 4.5);
+  cairo_stroke(c);
+}
+
+/* ---- header ---- */
+
+static void draw_avatar(cairo_t *c, double cx, double cy, double r) {
+  cairo_save(c);
+  cairo_new_path(c);
+  cairo_arc(c, cx, cy, r, 0, 2 * M_PI);
+  cairo_clip(c);
+  if (g_avatar) {
+    gdk_cairo_set_source_pixbuf(c, g_avatar, cx - r, cy - r);
+    cairo_paint(c);
+  } else {
+    double rr, gg, bb;
+    name_to_color(g_login, &rr, &gg, &bb);
+    cairo_set_source_rgba(c, rr, gg, bb, 1);
+    cairo_paint(c);
+    char letter[2] = {(char)toupper((unsigned char)g_user_name[0]), 0};
+    set_font(c, 16, 1);
+    cairo_text_extents_t le;
+    cairo_text_extents(c, letter, &le);
+    cairo_set_source_rgba(c, 1, 1, 1, 0.95);
+    cairo_move_to(c, cx - le.width / 2 - le.x_bearing,
+                  cy - le.height / 2 - le.y_bearing);
+    cairo_show_text(c, letter);
+  }
+  cairo_restore(c);
+
+  cairo_new_path(c);
+  cairo_arc(c, cx, cy, r - 0.5, 0, 2 * M_PI);
+  cairo_set_source_rgba(c, 1, 1, 1, 0.32);
+  cairo_set_line_width(c, 1.0);
+  cairo_stroke(c);
+}
+
+static void draw_header(cairo_t *c) {
+  const double W = g_pw, cy = HEADER_H / 2.0;
+
+  /* separator line between the header and the body */
+  cairo_set_source_rgba(c, 1, 1, 1, 0.12);
+  cairo_rectangle(c, 1, HEADER_H - 1, W - 2, 1);
+  cairo_fill(c);
+
+  /* real profile picture + real user name */
+  draw_avatar(c, 30, cy, AVATAR_R);
+  set_font(c, 14.5, 0);
+  char nb[160];
+  ellipsize_fit(c, g_user_name, SEARCH_X - 18 - 54, nb, sizeof(nb));
+  txt(c, nb, 54, cy + 5, 0.95);
+
+  /* search field */
+  rounded_rect(c, SEARCH_X + 0.5, SEARCH_Y + 0.5, SEARCH_W - 1, SEARCH_H - 1, 6);
+  cairo_set_source_rgba(c, 0, 0, 0, 0.28);
+  cairo_fill_preserve(c);
+  cairo_set_source_rgba(c, 1, 1, 1, 0.13);
+  cairo_set_line_width(c, 1.0);
+  cairo_stroke(c);
+  ic_search(c, SEARCH_X + 16, cy - 0.5, 0.65);
+
+  double tx = SEARCH_X + 34, avail = SEARCH_W - 34 - 12;
+  set_font(c, 14, 0);
+  cairo_save(c);
+  cairo_rectangle(c, tx - 3, SEARCH_Y + 2, avail + 3, SEARCH_H - 4);
+  cairo_clip(c);
+  if (g_search_len == 0) {
+    cairo_set_source_rgba(c, 1, 1, 1, 0.9);
+    cairo_rectangle(c, tx - 1, cy - 8, 1.4, 16);
+    cairo_fill(c);
+    txt(c, "Search...", tx + 4, cy + 5, 0.55);
+  } else {
+    double w = txt_w(c, g_search);
+    double shift = w > avail - 6 ? avail - 6 - w : 0;
+    txt(c, g_search, tx + shift, cy + 5, 0.95);
+    cairo_set_source_rgba(c, 1, 1, 1, 0.9);
+    cairo_rectangle(c, tx + shift + w + 2, cy - 8, 1.4, 16);
+    cairo_fill(c);
+  }
+  cairo_restore(c);
+
+  /* configure + pin buttons */
+  double bcx[2] = {W - 52, W - 22};
+  Rect *br[2] = {&g_r_conf, &g_r_pin};
+  int bid[2] = {UI_CONF, UI_PIN};
+  for (int i = 0; i < 2; i++) {
+    *br[i] = (Rect){bcx[i] - 14, cy - 14, 28, 28};
+    if (g_hov == bid[i]) {
+      rounded_rect(c, br[i]->x, br[i]->y, 28, 28, 6);
+      cairo_set_source_rgba(c, 1, 1, 1, 0.10);
+      cairo_fill(c);
+    }
+  }
+  ic_sliders(c, bcx[0], cy, 0.8);
+  ic_pin(c, bcx[1], cy, 0.8, g_pinned);
+}
+
+/* ---- sidebar ---- */
+
+static void draw_side_icon(cairo_t *c, int s, double cx, double cy) {
+  if (s == SEC_FAV) {
+    ic_bookmark(c, cx, cy, 0.9);
+    return;
+  }
+  if (s == SEC_ALL) {
+    ic_apps4(c, cx, cy, 1, 1);
+    return;
+  }
+  if (!g_side_tried[s]) {
+    g_side_tried[s] = 1;
+    for (int k = 0; k < 2 && !g_side_pb[s]; k++)
+      g_side_pb[s] = theme_icon_strict(SEC_ICON[s][k], SIDE_ICON);
+  }
+  if (g_side_pb[s]) {
+    gdk_cairo_set_source_pixbuf(c, g_side_pb[s], cx - SIDE_ICON / 2.0,
+                                cy - SIDE_ICON / 2.0);
+    cairo_paint(c);
+    return;
+  }
+  /* no theme icon: coloured disc with the first letter */
+  double r, g, b;
+  name_to_color(SEC_NAMES[s], &r, &g, &b);
+  cairo_new_path(c);
+  cairo_arc(c, cx, cy, SIDE_ICON / 2.0, 0, 2 * M_PI);
+  cairo_set_source_rgba(c, r, g, b, 0.95);
+  cairo_fill(c);
+  char letter[2] = {SEC_NAMES[s][0], 0};
+  set_font(c, 11, 1);
+  cairo_text_extents_t le;
+  cairo_text_extents(c, letter, &le);
+  cairo_set_source_rgba(c, 0, 0, 0, 0.95);
+  cairo_move_to(c, cx - le.width / 2 - le.x_bearing,
+                cy - le.height / 2 - le.y_bearing);
+  cairo_show_text(c, letter);
+}
+
+static void draw_sidebar(cairo_t *c) {
+  int nvis = 0;
+  for (int s = 0; s < SEC_COUNT; s++)
+    if (g_sec_visible[s])
+      nvis++;
+  double pitch = (BAR_Y - 6 - SIDE_LIST_Y - SIDE_GAP) / (double)nvis;
+  if (pitch > 30)
+    pitch = 30;
+  double item_h = pitch - 2;
+
+  double y = SIDE_LIST_Y;
+  int divided = 0;
+  set_font(c, 14, 0);
+
+  for (int s = 0; s < SEC_COUNT; s++) {
+    g_r_side[s] = (Rect){0, 0, 0, 0};
+    if (!g_sec_visible[s])
+      continue;
+
+    if (s >= SEC_DEV && !divided) {
+      divided = 1;
+      cairo_set_source_rgba(c, 1, 1, 1, 0.12);
+      cairo_rectangle(c, 14, y + SIDE_GAP / 2.0 - 1, SIDE_W - 28, 1);
+      cairo_fill(c);
+      y += SIDE_GAP;
+    }
+
+    Rect r = {8, y, SIDE_W - 16, item_h};
+    g_r_side[s] = r;
+    int sel = (g_mode == 0 && s == g_sec);
+
+    if (sel) {
+      rounded_rect(c, r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1, 5);
+      cairo_set_source_rgba(c, ACC_R, ACC_G, ACC_B, 0.22);
+      cairo_fill_preserve(c);
+      cairo_set_source_rgba(c, ACC_R, ACC_G, ACC_B, 0.9);
+      cairo_set_line_width(c, 1.3);
+      cairo_stroke(c);
+    } else if (g_hov == UI_SIDE0 + s) {
+      rounded_rect(c, r.x, r.y, r.w, r.h, 5);
+      cairo_set_source_rgba(c, 1, 1, 1, 0.08);
+      cairo_fill(c);
+    }
+
+    double cy = r.y + r.h / 2.0;
+    draw_side_icon(c, s, r.x + 22, cy);
+    set_font(c, 14, 0);
+    txt(c, SEC_NAMES[s], r.x + 42, cy + 5, 0.95);
+    y += pitch;
+  }
+}
+
+/* ---- grid ---- */
+
+static void draw_grid(cairo_t *c) {
+  if (g_filtered_count == 0) {
+    double mx = GRID_X + COLS * COL_W / 2.0;
+    int fav = (g_mode == 0 && g_search_len == 0 && g_sec == SEC_FAV);
+    const char *msg = fav ? "No favorites yet" : "No matching apps";
+    set_font(c, 16, 0);
+    cairo_set_source_rgba(c, 1, 1, 1, 0.65);
+    cairo_move_to(c, mx - txt_w(c, msg) / 2.0, GRID_Y + 80);
+    cairo_show_text(c, msg);
+    if (fav) {
+      const char *m2 = "Right-click an app to add it here";
+      set_font(c, 12.5, 0);
+      cairo_set_source_rgba(c, 1, 1, 1, 0.45);
+      cairo_move_to(c, mx - txt_w(c, m2) / 2.0, GRID_Y + 102);
+      cairo_show_text(c, m2);
+    }
+    return;
+  }
+
+  int start = g_scroll_row * COLS;
+  int end = start + VROWS * COLS;
+  if (end > g_filtered_count)
+    end = g_filtered_count;
+
+  for (int fi = start; fi < end; fi++) {
+    int rel = fi - start;
+    int col = rel % COLS;
+    int row = rel / COLS;
+
+    double cx = GRID_X + col * COL_W + COL_W / 2.0;
+    double y = GRID_Y + row * ROW_H;
+
+    AppEntry *app = &g_apps[g_filtered[fi]];
+    ensure_app_icon(app);
+
+    if (fi == g_selected) {
+      rounded_rect(c, cx - TILE_W / 2.0 + 0.5, y + 0.5, TILE_W - 1, TILE_H - 1, 8);
+      cairo_set_source_rgba(c, ACC_R, ACC_G, ACC_B, 0.26);
+      cairo_fill_preserve(c);
+      cairo_set_source_rgba(c, 1, 1, 1, 0.14);
+      cairo_set_line_width(c, 1.0);
+      cairo_stroke(c);
+    }
+
+    double ix = cx - ICON / 2.0;
+    double iy = y + 10;
+
+    if (app->pixbuf) {
+      cairo_save(c);
+      gdk_cairo_set_source_pixbuf(c, app->pixbuf, ix, iy);
+      cairo_rectangle(c, ix, iy, ICON, ICON);
+      cairo_fill(c);
+      cairo_restore(c);
+    } else {
+      double r, g, b;
+      name_to_color(app->name, &r, &g, &b);
+      rounded_rect(c, ix, iy, ICON, ICON, 12);
+      cairo_set_source_rgba(c, r, g, b, 0.92);
+      cairo_fill(c);
+
+      char letter[2] = {(char)toupper((unsigned char)app->name[0]), 0};
+      set_font(c, 22, 1);
+      cairo_text_extents_t le;
+      cairo_text_extents(c, letter, &le);
+      cairo_set_source_rgba(c, 1, 1, 1, 0.95);
+      cairo_move_to(c, ix + (ICON - le.width) / 2 - le.x_bearing,
+                    iy + (ICON - le.height) / 2 - le.y_bearing);
+      cairo_show_text(c, letter);
+    }
+
+    set_font(c, 12.5, 0);
+    draw_label(c, app->name, cx, iy + ICON + 18);
+  }
+
+  /* thin scrollbar when there is more than one page */
+  int total_rows = (g_filtered_count + COLS - 1) / COLS;
+  if (total_rows > VROWS) {
+    double th = VROWS * ROW_H - 8;
+    double bh = th * VROWS / total_rows;
+    if (bh < 24)
+      bh = 24;
+    double by = GRID_Y + (th - bh) * g_scroll_row / (total_rows - VROWS);
+    rounded_rect(c, g_pw - 8, by, 3, bh, 1.5);
+    cairo_set_source_rgba(c, 1, 1, 1, 0.28);
+    cairo_fill(c);
+  }
+}
+
+/* ---- bottom bar ---- */
+
+static const char *POW0[3] = {"Sleep", "Restart", "Shut Down"};
+static const char *POW1[2] = {"Lock Screen", "Log Out"};
+static const char *POW_CMD0[3] = {"systemctl suspend", "systemctl reboot",
+                                  "systemctl poweroff"};
+static const char *POW_CMD1[2] = {
+    "loginctl lock-session",
+    "[ -n \"$XDG_SESSION_ID\" ] && exec loginctl terminate-session "
+    "\"$XDG_SESSION_ID\""};
+
+static void draw_bottom(cairo_t *c) {
+  const double W = g_pw, cy = BAR_Y + BAR_H / 2.0;
+  set_font(c, 13.5, 0);
+
+  /* tabs: Applications | Places */
+  const char *tn[2] = {"Applications", "Places"};
+  double x = 10;
+  for (int i = 0; i < 2; i++) {
+    double w = 14 + 18 + 8 + txt_w(c, tn[i]) + 14;
+    g_r_tab[i] = (Rect){x, BAR_Y, w, BAR_H};
+    int active = (g_mode == i);
+    if (!active && g_hov == UI_TAB0 + i) {
+      cairo_set_source_rgba(c, 1, 1, 1, 0.06);
+      cairo_rectangle(c, x, BAR_Y + 1, w, BAR_H - 1);
+      cairo_fill(c);
+    }
+    double a = active ? 0.95 : 0.72;
+    if (i == 0)
+      ic_apps4(c, x + 14 + 9, cy + 1, a, 0);
+    else
+      ic_compass(c, x + 14 + 9, cy + 1, a);
+    set_font(c, 13.5, 0);
+    txt(c, tn[i], x + 14 + 18 + 8, cy + 5.5, a);
+    if (active) {
+      cairo_set_source_rgba(c, ACC_R, ACC_G, ACC_B, 1);
+      cairo_rectangle(c, x, BAR_Y, w, 2.5);
+      cairo_fill(c);
+    }
+    x += w + 2;
+  }
+
+  /* power buttons (right aligned) + chevron */
+  int n = g_leave_alt ? 2 : 3;
+  g_pow_n = n;
+  const char **lab = g_leave_alt ? POW1 : POW0;
+  double rx = W - 52;
+  for (int j = 2; j >= 0; j--) {
+    if (j >= n) {
+      g_r_pow[j] = (Rect){0, 0, 0, 0};
+      continue;
+    }
+    set_font(c, 13.5, 0);
+    double w = 12 + 16 + 7 + txt_w(c, lab[j]) + 12;
+    double bx = rx - w;
+    g_r_pow[j] = (Rect){bx, BAR_Y + 6, w, BAR_H - 12};
+    if (g_hov == UI_POW0 + j) {
+      rounded_rect(c, bx, BAR_Y + 6, w, BAR_H - 12, 6);
+      cairo_set_source_rgba(c, 1, 1, 1, 0.10);
+      cairo_fill(c);
+    }
+    double ix = bx + 12 + 8;
+    if (!g_leave_alt) {
+      if (j == 0)
+        ic_moon(c, ix, cy, 0.9);
+      else if (j == 1)
+        ic_restart(c, ix, cy, 0.9);
+      else
+        ic_power(c, ix, cy, 0.9);
+    } else {
+      if (j == 0)
+        ic_lock(c, ix, cy, 0.9);
+      else
+        ic_logout(c, ix, cy, 0.9);
+    }
+    set_font(c, 13.5, 0);
+    txt(c, lab[j], bx + 12 + 16 + 7, cy + 5.5, 0.9);
+    rx = bx - 2;
+  }
+
+  g_r_chev = (Rect){W - 44, BAR_Y + 6, 36, BAR_H - 12};
+  if (g_hov == UI_CHEV) {
+    rounded_rect(c, g_r_chev.x, g_r_chev.y, g_r_chev.w, g_r_chev.h, 6);
+    cairo_set_source_rgba(c, 1, 1, 1, 0.10);
+    cairo_fill(c);
+  }
+  ic_chevron(c, W - 26, cy, 0.85, !g_leave_alt);
+}
+
+static void draw_panel(cairo_t *c) {
+  const double W = g_pw, H = g_ph;
+
+  cairo_set_operator(c, CAIRO_OPERATOR_CLEAR);
+  cairo_paint(c);
+  cairo_set_operator(c, CAIRO_OPERATOR_OVER);
+
+  /* body */
+  rounded_rect(c, 0.5, 0.5, W - 1, H - 1, PANEL_R);
+  cairo_set_source_rgba(c, BG_R, BG_G, BG_B, BG_A);
+  cairo_fill(c);
+
+  /* darker sidebar and bottom bar, clipped to the rounded body */
+  cairo_save(c);
+  rounded_rect(c, 0.5, 0.5, W - 1, H - 1, PANEL_R);
+  cairo_clip(c);
+  cairo_set_source_rgba(c, 0, 0, 0, 0.16);
+  cairo_rectangle(c, 0, HEADER_H, SIDE_W, BAR_Y - HEADER_H);
+  cairo_fill(c);
+  cairo_set_source_rgba(c, 0, 0, 0, 0.20);
+  cairo_rectangle(c, 0, BAR_Y, W, BAR_H);
+  cairo_fill(c);
+  cairo_set_source_rgba(c, 1, 1, 1, 0.09);
+  cairo_rectangle(c, 0, BAR_Y, W, 1);
+  cairo_fill(c);
+  cairo_restore(c);
+
+  /* border */
+  rounded_rect(c, 0.5, 0.5, W - 1, H - 1, PANEL_R);
+  cairo_set_source_rgba(c, 1, 1, 1, 0.16);
+  cairo_set_line_width(c, 1.0);
+  cairo_stroke(c);
+
+  draw_header(c);
+  draw_sidebar(c);
+  draw_grid(c);
+  draw_bottom(c);
+}
+
+static cairo_surface_t *g_bs;
+static cairo_t *g_bb;
+
+static void render(int full) {
+  (void)full;
+  if (!g_bs) { /* persistent back buffer: allocated once */
+    g_bs = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, g_pw, g_ph);
+    g_bb = cairo_create(g_bs);
+  }
+  draw_panel(g_bb);
+
+  if (!g_have_alpha) {
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgb(cr, BG_R, BG_G, BG_B);
+    cairo_paint(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+  } else {
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+  }
+  cairo_set_source_surface(cr, g_bs, 0, 0);
+  cairo_paint(cr);
+  cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+
+  cairo_surface_flush(surface);
+  xcb_flush(conn);
+}
+
+/* ---------------------------------------------------------------- */
+/* Input helpers                                                     */
+/* ---------------------------------------------------------------- */
+
+/* keys that only change modifier/lock state (Shift, Ctrl, Alt, Super/Meta,
+ * Hyper, AltGr, CapsLock, NumLock, ...) must never close the launcher */
+static int is_modifier_key(xcb_keysym_t sym) {
+  if (sym >= 0xffe1 && sym <= 0xffee) /* Shift_L .. Hyper_R (incl. Super) */
+    return 1;
+  if (sym >= 0xfe01 && sym <= 0xfe13) /* ISO_Lock .. ISO_Level5_Lock */
+    return 1;
+  switch (sym) {
+  case XK_Caps_Lock: case XK_Shift_Lock: case XK_Num_Lock:
+  case XK_Scroll_Lock: case XK_Mode_switch: case XK_Multi_key:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int inside_panel(int x, int y) {
+  return x >= g_px && x < g_px + g_pw && y >= g_py && y < g_py + g_ph;
+}
+
+static int in_rect(const Rect *r, int x, int y) {
+  return r->w > 0 && x >= r->x && x < r->x + r->w && y >= r->y &&
+         y < r->y + r->h;
+}
+
+/* which button / sidebar entry / tab is under the pointer */
+static int hit_ui(int x, int y) {
+  if (in_rect(&g_r_conf, x, y))
+    return UI_CONF;
+  if (in_rect(&g_r_pin, x, y))
+    return UI_PIN;
+  if (in_rect(&g_r_chev, x, y))
+    return UI_CHEV;
+  for (int j = 0; j < g_pow_n; j++)
+    if (in_rect(&g_r_pow[j], x, y))
+      return UI_POW0 + j;
+  for (int i = 0; i < 2; i++)
+    if (in_rect(&g_r_tab[i], x, y))
+      return UI_TAB0 + i;
+  for (int s = 0; s < SEC_COUNT; s++)
+    if (in_rect(&g_r_side[s], x, y))
+      return UI_SIDE0 + s;
+  return UI_NONE;
+}
+
+static int tile_at(int px, int py) {
+  int lx = px - g_px - GRID_X, ly = py - g_py - GRID_Y;
+  if (lx < 0 || ly < 0)
+    return -1;
+  int c = lx / COL_W, r = ly / ROW_H;
+  if (c >= COLS || r >= VROWS)
+    return -1;
+  if (ly % ROW_H > TILE_H)
+    return -1;
+  int fi = (g_scroll_row + r) * COLS + c;
+  if (fi < 0 || fi >= g_filtered_count)
+    return -1;
+  return fi;
+}
+
+static void scroll_rows(int delta) {
+  g_scroll_row += delta;
+  clamp_scroll();
+
+  int sel_row = g_selected / COLS;
+  int sel_col = g_selected % COLS;
+  if (sel_row < g_scroll_row)
+    g_selected = g_scroll_row * COLS + sel_col;
+  else if (sel_row >= g_scroll_row + VROWS)
+    g_selected = (g_scroll_row + VROWS - 1) * COLS + sel_col;
+
+  if (g_selected >= g_filtered_count)
+    g_selected = g_filtered_count > 0 ? g_filtered_count - 1 : 0;
+
+  g_dirty = 1;
+}
+
+static void grab_input(void) {
+  xcb_grab_keyboard_cookie_t grab_cookie =
+      xcb_grab_keyboard(conn, 1, screen->root, XCB_CURRENT_TIME,
+                        XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC);
+  xcb_grab_keyboard_reply_t *grab_reply =
+      xcb_grab_keyboard_reply(conn, grab_cookie, NULL);
+  if (!grab_reply || grab_reply->status != XCB_GRAB_STATUS_SUCCESS) {
+    fprintf(stderr, "applauncher: keyboard grab unavailable; continuing "
+                    "without global grab\n");
+  }
+  free(grab_reply);
+
+  /* grab the pointer: clicks outside our window still reach us */
+  xcb_grab_pointer_cookie_t pg = xcb_grab_pointer(
+      conn, 1, win,
+      XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
+          XCB_EVENT_MASK_POINTER_MOTION,
+      XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC, XCB_NONE, XCB_NONE,
+      XCB_CURRENT_TIME);
+  free(xcb_grab_pointer_reply(conn, pg, NULL));
+}
+
+/* pinned: stay open, let the rest of the desktop be used */
+static void set_pinned(int p) {
+  g_pinned = p;
+  if (p) {
+    xcb_ungrab_pointer(conn, XCB_CURRENT_TIME);
+    xcb_ungrab_keyboard(conn, XCB_CURRENT_TIME);
+    xcb_set_input_focus(conn, XCB_INPUT_FOCUS_POINTER_ROOT, win,
+                        XCB_CURRENT_TIME);
+  } else {
+    grab_input();
+  }
+  xcb_flush(conn);
+}
+
+static void handle_ui(int ui, int *running) {
+  if (ui == UI_TAB0 || ui == UI_TAB1) {
+    g_mode = ui - UI_TAB0;
+    g_search_len = 0;
+    g_search[0] = '\0';
+    recompute_filter();
+  } else if (ui >= UI_POW0 && ui < UI_POW0 + 3) {
+    int j = ui - UI_POW0;
+    run_cmd(g_leave_alt ? POW_CMD1[j] : POW_CMD0[j]);
+    if (!g_pinned)
+      *running = 0;
+  } else if (ui == UI_CHEV) {
+    g_leave_alt = !g_leave_alt;
+  } else if (ui == UI_CONF) {
+    run_cmd("kmenuedit");
+    if (!g_pinned)
+      *running = 0;
+  } else if (ui == UI_PIN) {
+    set_pinned(!g_pinned);
+  } else if (ui >= UI_SIDE0) {
+    set_section(ui - UI_SIDE0);
+  }
+}
+
+/* ---------------------------------------------------------------- */
+/* Main                                                              */
+/* ---------------------------------------------------------------- */
+
+int main(int argc, char **argv) {
+  if (!gdk_init_check(&argc, &argv)) {
+    fprintf(stderr, "applauncher: cannot initialize GDK\n");
+    return 1;
+  }
+
+  discover_apps();
+  load_favorites();
+  add_places();
+  compute_sections();
+  load_user_info();
+  recompute_filter();
+
+  conn = xcb_connect(NULL, NULL);
+  if (xcb_connection_has_error(conn)) {
+    fprintf(stderr, "applauncher: cannot connect to X server\n");
+    xcb_disconnect(conn);
+    return 1;
+  }
+
+  screen = xcb_setup_roots_iterator(xcb_get_setup(conn)).data;
+  if (!screen) {
+    fprintf(stderr, "applauncher: cannot find X screen\n");
+    xcb_disconnect(conn);
+    return 1;
+  }
+  compute_layout();
+
+  xcb_depth_t *argb_depth = NULL;
+  xcb_visualtype_t *argb_vis = find_argb_visual(&argb_depth);
+  xcb_visualtype_t *vis = NULL;
+  uint8_t depth = screen->root_depth;
+  xcb_colormap_t cmap = XCB_COLORMAP_NONE;
+
+  if (argb_vis && argb_depth && argb_depth->depth == 32) {
+    vis = argb_vis;
+    depth = argb_depth->depth;
+    g_have_alpha = 1;
+
+    cmap = xcb_generate_id(conn);
+    xcb_create_colormap(conn, XCB_COLORMAP_ALLOC_NONE, cmap, screen->root,
+                        vis->visual_id);
+  } else {
+    xcb_depth_iterator_t di = xcb_screen_allowed_depths_iterator(screen);
+    for (; di.rem; xcb_depth_next(&di)) {
+      xcb_visualtype_iterator_t vi = xcb_depth_visuals_iterator(di.data);
+      for (; vi.rem; xcb_visualtype_next(&vi)) {
+        if (vi.data->visual_id == screen->root_visual) {
+          vis = vi.data;
+          break;
+        }
+      }
+      if (vis)
+        break;
+    }
+    fprintf(stderr,
+            "applauncher: ARGB visual unavailable; using root visual fallback\n");
+  }
+
+  if (!vis) {
+    fprintf(stderr, "applauncher: cannot find a compatible X visual\n");
+    if (cmap != XCB_COLORMAP_NONE)
+      xcb_free_colormap(conn, cmap);
+    xcb_disconnect(conn);
+    return 1;
+  }
+
+  win = xcb_generate_id(conn);
+
+  const uint32_t ev_mask = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_KEY_PRESS |
+                           XCB_EVENT_MASK_BUTTON_PRESS |
+                           XCB_EVENT_MASK_BUTTON_RELEASE |
+                           XCB_EVENT_MASK_POINTER_MOTION;
+  uint32_t mask = 0;
+  uint32_t values[5];
+  int idx = 0;
+
+  if (g_have_alpha) {
+    mask |= XCB_CW_BACK_PIXEL;
+    values[idx++] = 0;
+    mask |= XCB_CW_BORDER_PIXEL;
+    values[idx++] = 0;
+    mask |= XCB_CW_OVERRIDE_REDIRECT;
+    values[idx++] = 1;
+    mask |= XCB_CW_EVENT_MASK;
+    values[idx++] = ev_mask;
+    mask |= XCB_CW_COLORMAP;
+    values[idx++] = cmap;
+  } else {
+    mask |= XCB_CW_BACK_PIXEL;
+    values[idx++] = screen->black_pixel;
+    mask |= XCB_CW_OVERRIDE_REDIRECT;
+    values[idx++] = 1;
+    mask |= XCB_CW_EVENT_MASK;
+    values[idx++] = ev_mask;
+  }
+
+  xcb_void_cookie_t create_cookie = xcb_create_window_checked(
+      conn, depth, win, screen->root, (int16_t)g_wx, (int16_t)g_wy,
+      (uint16_t)g_pw, (uint16_t)g_ph, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+      vis->visual_id, mask, values);
+
+  xcb_generic_error_t *create_error = xcb_request_check(conn, create_cookie);
+  if (create_error) {
+    fprintf(stderr,
+            "applauncher: X could not create launcher window (error %u)\n",
+            create_error->error_code);
+    free(create_error);
+    if (cmap != XCB_COLORMAP_NONE)
+      xcb_free_colormap(conn, cmap);
+    xcb_disconnect(conn);
+    return 1;
+  }
+
+  xcb_map_window(conn, win);
+  xcb_flush(conn);
+
+  {
+    xcb_get_input_focus_reply_t *fr =
+        xcb_get_input_focus_reply(conn, xcb_get_input_focus(conn), NULL);
+    if (fr) {
+      g_prev_focus = fr->focus;
+      free(fr);
+    }
+  }
+  xcb_set_input_focus(conn, XCB_INPUT_FOCUS_POINTER_ROOT, win,
+                      XCB_CURRENT_TIME);
+
+  grab_input();
+
+  if (g_have_alpha)
+    set_blur_region();
+  xcb_flush(conn);
+
+  surface = cairo_xcb_surface_create(conn, win, vis, g_pw, g_ph);
+  if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+    fprintf(stderr, "applauncher: cairo surface creation failed\n");
+    xcb_destroy_window(conn, win);
+    xcb_disconnect(conn);
+    return 1;
+  }
+
+  cr = cairo_create(surface);
+  if (cairo_status(cr) != CAIRO_STATUS_SUCCESS) {
+    fprintf(stderr, "applauncher: cairo context creation failed\n");
+    cairo_destroy(cr);
+    cairo_surface_destroy(surface);
+    xcb_destroy_window(conn, win);
+    xcb_disconnect(conn);
+    return 1;
+  }
+
+  xcb_key_symbols_t *keysyms = xcb_key_symbols_alloc(conn);
+  if (!keysyms) {
+    fprintf(stderr, "applauncher: cannot initialize keyboard symbols\n");
+    cairo_destroy(cr);
+    cairo_surface_destroy(surface);
+    xcb_destroy_window(conn, win);
+    xcb_disconnect(conn);
+    return 1;
+  }
+
+  render(1);
+
+  int running = 1;
+  xcb_generic_event_t *ev;
+
+  while (running && (ev = xcb_wait_for_event(conn))) {
+   do {
+    switch (ev->response_type & ~0x80) {
+    case XCB_EXPOSE:
+      g_dirty = 1;
+      break;
+
+    case XCB_MOTION_NOTIFY: {
+      xcb_motion_notify_event_t *me = (xcb_motion_notify_event_t *)ev;
+      int ui = hit_ui(me->event_x, me->event_y);
+      if (ui != g_hov) {
+        g_hov = ui;
+        g_dirty = 1;
+      }
+      int fi = tile_at(me->event_x, me->event_y);
+      if (fi >= 0 && fi != g_selected) {
+        g_selected = fi;
+        g_dirty = 1;
+      }
+      break;
+    }
+
+    case XCB_BUTTON_PRESS: {
+      xcb_button_press_event_t *be = (xcb_button_press_event_t *)ev;
+
+      /* wheel: 4 up, 5 down, 6 left, 7 right */
+      if (be->detail >= 4 && be->detail <= 7) {
+        scroll_rows((be->detail == 4 || be->detail == 6) ? -1 : 1);
+        break;
+      }
+
+      /* a click (any button) outside the panel closes the launcher */
+      if (be->detail >= 1 && be->detail <= 3 &&
+          !inside_panel(be->event_x, be->event_y)) {
+        if (!g_pinned)
+          running = 0;
+        break;
+      }
+
+      if (be->detail == 3) { /* right click on a tile: favorite on/off */
+        int fi = tile_at(be->event_x, be->event_y);
+        if (fi >= 0 && g_mode == 0) {
+          toggle_favorite(g_filtered[fi]);
+          g_dirty = 1;
+        }
+        break;
+      }
+
+      if (be->detail != 1)
+        break;
+
+      if (!inside_panel(be->event_x, be->event_y)) {
+        if (!g_pinned)
+          running = 0; /* click outside closes */
+        break;
+      }
+
+      if (g_pinned)
+        xcb_set_input_focus(conn, XCB_INPUT_FOCUS_POINTER_ROOT, win,
+                            XCB_CURRENT_TIME);
+
+      int ui = hit_ui(be->event_x, be->event_y);
+      if (ui != UI_NONE) {
+        handle_ui(ui, &running);
+        g_dirty = 1;
+        break;
+      }
+
+      int fi = tile_at(be->event_x, be->event_y);
+      if (fi >= 0) {
+        launch_app(&g_apps[g_filtered[fi]]);
+        if (!g_pinned)
+          running = 0;
+      }
+      break;
+    }
+
+    case XCB_KEY_PRESS: {
+      xcb_key_press_event_t *ke = (xcb_key_press_event_t *)ev;
+      int col_idx = (ke->state & XCB_MOD_MASK_SHIFT) ? 1 : 0;
+      xcb_keysym_t sym = xcb_key_symbols_get_keysym(keysyms, ke->detail, col_idx);
+
+      if (sym == XK_Escape) {
+        running = 0;
+      } else if (sym == XK_Return || sym == XK_KP_Enter) {
+        if (g_filtered_count > 0) {
+          launch_app(&g_apps[g_filtered[g_selected]]);
+          if (!g_pinned)
+            running = 0;
+        }
+      } else if (sym == XK_BackSpace) {
+        if (g_search_len > 0) {
+          g_search[--g_search_len] = '\0';
+          if (g_search_len == 0)
+            g_sec = g_pre_sec; /* back to where the search started */
+          recompute_filter();
+          g_dirty = 1;
+        }
+      } else if (sym == XK_Tab) {
+        step_section(1);
+        g_dirty = 1;
+      } else if (sym == XK_ISO_Left_Tab) {
+        step_section(-1);
+        g_dirty = 1;
+      } else if (sym == XK_Left) {
+        if (g_selected > 0) {
+          g_selected--;
+          ensure_selected_visible();
+          g_dirty = 1;
+        }
+      } else if (sym == XK_Right) {
+        if (g_selected + 1 < g_filtered_count) {
+          g_selected++;
+          ensure_selected_visible();
+          g_dirty = 1;
+        }
+      } else if (sym == XK_Up) {
+        if (g_selected - COLS >= 0) {
+          g_selected -= COLS;
+          ensure_selected_visible();
+          g_dirty = 1;
+        }
+      } else if (sym == XK_Down) {
+        if (g_selected + COLS < g_filtered_count) {
+          g_selected += COLS;
+          ensure_selected_visible();
+          g_dirty = 1;
+        } else if (g_selected / COLS < (g_filtered_count - 1) / COLS) {
+          g_selected = g_filtered_count - 1; /* jump to last partial row */
+          ensure_selected_visible();
+          g_dirty = 1;
+        }
+      } else if (sym == XK_Prior) {
+        scroll_rows(-VROWS);
+      } else if (sym == XK_Next) {
+        scroll_rows(VROWS);
+      } else if (sym >= 0x20 && sym <= 0x7e &&
+                 !(ke->state & (XCB_MOD_MASK_CONTROL | XCB_MOD_MASK_1 |
+                                XCB_MOD_MASK_4))) {
+        if (g_search_len + 1 < SEARCH_LEN) {
+          if (g_search_len == 0)
+            g_pre_sec = (g_mode == 0) ? g_sec : SEC_ALL;
+          g_search[g_search_len++] = (char)sym;
+          g_search[g_search_len] = '\0';
+          g_mode = 0;
+          g_sec = SEC_ALL; /* search is global */
+          recompute_filter();
+          g_dirty = 1;
+        }
+      } else if (sym != 0 && !is_modifier_key(sym)) {
+        /* any key the launcher does not use (F-keys, Super, Alt/Ctrl
+         * shortcuts, Home/End, ...) closes it, like KDE's launcher */
+        if (!g_pinned)
+          running = 0;
+      }
+      break;
+    }
+
+    default:
+      break;
+    }
+
+    free(ev);
+   } while (running && (ev = xcb_poll_for_event(conn)));
+
+    if (running && g_dirty) { /* one redraw per batch of events */
+      render(0);
+      g_dirty = 0;
+    }
+  }
+
+  xcb_ungrab_pointer(conn, XCB_CURRENT_TIME);
+  xcb_key_symbols_free(keysyms);
+  xcb_ungrab_keyboard(conn, XCB_CURRENT_TIME);
+
+  /* give focus back to whoever had it (only if we didn't launch an app;
+   * then the window manager focuses the new window itself) */
+  if (!g_launched && g_prev_focus > 1)
+    xcb_set_input_focus(conn, XCB_INPUT_FOCUS_POINTER_ROOT, g_prev_focus,
+                        XCB_CURRENT_TIME);
+  xcb_flush(conn);
+
+  free_app_icons();
+  free_ui_icons();
+
+  if (g_bb)
+    cairo_destroy(g_bb);
+  if (g_bs)
+    cairo_surface_destroy(g_bs);
+  cairo_destroy(cr);
+  cairo_surface_destroy(surface);
+
+  xcb_destroy_window(conn, win);
+  if (cmap != XCB_COLORMAP_NONE)
+    xcb_free_colormap(conn, cmap);
+
+  xcb_flush(conn);
+  xcb_disconnect(conn);
+  return 0;
+}

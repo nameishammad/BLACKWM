@@ -1,0 +1,654 @@
+#include <X11/Xft/Xft.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <cairo/cairo-xlib.h>
+#include <cairo/cairo.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAIN_WIDTH 480
+#define MAIN_HEIGHT 400
+
+typedef struct {
+  int x, y, w, h;
+  char label[32];
+  char status[32];
+  int active;
+  int has_arrow;
+} Tile;
+
+Tile tiles[4] = {{20, 70, 215, 65, "Wi-Fi", "Checking...", 0, 1},
+{245, 70, 215, 65, "Bluetooth", "Checking...", 0, 1},
+{20, 145, 215, 65, "Do Not Disturb", "Off", 0, 0},
+{245, 145, 215, 65, "Airplane Mode", "Off", 0, 0}};
+
+int volume_val = 75;
+int mic_val = 60;
+int is_dragging_vol = 0;
+int is_dragging_mic = 0;
+int hovered_element = -1;
+
+unsigned long get_color(Display *d, const char *hex) {
+  XColor col;
+  Colormap cmap = DefaultColormap(d, DefaultScreen(d));
+  XParseColor(d, cmap, hex, &col);
+  XAllocColor(d, cmap, &col);
+  return col.pixel;
+}
+
+void draw_rounded_rectangle(Display *d, Drawable w, GC gc, int x, int y,
+                            int width, int height, int r, int fill) {
+  int screen = DefaultScreen(d);
+  cairo_surface_t *surface = cairo_xlib_surface_create(
+    d, w, DefaultVisual(d, screen), MAIN_WIDTH, MAIN_HEIGHT);
+  cairo_t *cr = cairo_create(surface);
+
+  double radius = r;
+  if (radius > height / 2.0) radius = height / 2.0;
+  if (radius > width / 2.0) radius = width / 2.0;
+
+  cairo_new_path(cr);
+  cairo_move_to(cr, x + radius, y);
+  cairo_line_to(cr, x + width - radius, y);
+  cairo_arc(cr, x + width - radius, y + radius, radius, -M_PI / 2.0, 0);
+  cairo_line_to(cr, x + width, y + height - radius);
+  cairo_arc(cr, x + width - radius, y + height - radius, radius, 0, M_PI / 2.0);
+  cairo_line_to(cr, x + radius, y + height);
+  cairo_arc(cr, x + radius, y + height - radius, radius, M_PI / 2.0, M_PI);
+  cairo_line_to(cr, x, y + radius);
+  cairo_arc(cr, x + radius, y + radius, radius, M_PI, 3.0 * M_PI / 2.0);
+  cairo_close_path(cr);
+
+  if (fill) {
+    XGCValues values;
+    XGetGCValues(d, gc, GCForeground, &values);
+    XColor xc;
+    xc.pixel = values.foreground;
+    Colormap cmap = DefaultColormap(d, screen);
+    XQueryColor(d, cmap, &xc);
+
+    cairo_set_source_rgb(cr, xc.red / 65535.0, xc.green / 65535.0,
+                         xc.blue / 65535.0);
+    cairo_fill(cr);
+  }
+
+  cairo_destroy(cr);
+  cairo_surface_destroy(surface);
+                            }
+
+                            void draw_text(Display *d, XftDraw *xft_draw, XftFont *font,
+                                           const char *hex_color, int x, int y, const char *text) {
+                              XftColor xft_col;
+                              Visual *visual = DefaultVisual(d, DefaultScreen(d));
+                              Colormap cmap = DefaultColormap(d, DefaultScreen(d));
+                              XftColorAllocName(d, visual, cmap, hex_color, &xft_col);
+                              XftDrawStringUtf8(xft_draw, &xft_col, font, x, y, (const FcChar8 *)text,
+                                                strlen(text));
+                              XftColorFree(d, visual, cmap, &xft_col);
+                                           }
+
+                                           void draw_clean_arrow(Display *d, Drawable pix, int x, int y, const char *hex_color) {
+                                             cairo_surface_t *surface = cairo_xlib_surface_create(
+                                               d, pix, DefaultVisual(d, DefaultScreen(d)), MAIN_WIDTH, MAIN_HEIGHT);
+                                             cairo_t *cr = cairo_create(surface);
+                                             cairo_set_antialias(cr, CAIRO_ANTIALIAS_BEST);
+
+                                             unsigned long col = get_color(d, hex_color);
+                                             XColor xc; xc.pixel = col;
+                                             Colormap cmap = DefaultColormap(d, DefaultScreen(d));
+                                             XQueryColor(d, cmap, &xc);
+                                             cairo_set_source_rgb(cr, xc.red / 65535.0, xc.green / 65535.0, xc.blue / 65535.0);
+
+                                             cairo_set_line_width(cr, 1.8);
+                                             cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+                                             cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+
+                                             cairo_move_to(cr, x, y - 5);
+                                             cairo_line_to(cr, x + 5, y);
+                                             cairo_line_to(cr, x, y + 5);
+                                             cairo_stroke(cr);
+
+                                             cairo_destroy(cr);
+                                             cairo_surface_destroy(surface);
+                                           }
+
+                                           // ================= SYSTEM HARDWARE LOGIC =================
+
+                                           void get_wifi_name(char *out_name, int max_len, int *is_active) {
+                                             FILE *fp_radio = popen("nmcli radio wifi 2>/dev/null", "r");
+                                             char radio_status[16] = {0};
+                                             if (fp_radio) {
+                                               if (fgets(radio_status, sizeof(radio_status), fp_radio) != NULL) {
+                                                 radio_status[strcspn(radio_status, "\r\n")] = 0;
+                                               }
+                                               pclose(fp_radio);
+                                             }
+
+                                             if (strstr(radio_status, "disabled") != NULL) {
+                                               snprintf(out_name, max_len, "Off");
+                                               *is_active = 0;
+                                               return;
+                                             }
+
+                                             FILE *fp = popen("nmcli -t -f GENERAL.CONNECTION dev show 2>/dev/null | head -n 1 | cut -d':' -f2", "r");
+                                             if (fp) {
+                                               if (fgets(out_name, max_len, fp) != NULL) {
+                                                 out_name[strcspn(out_name, "\r\n")] = 0;
+                                                 if (strlen(out_name) > 0 && strcmp(out_name, "--") != 0) {
+                                                   *is_active = 1;
+                                                   pclose(fp);
+                                                   return;
+                                                 }
+                                               }
+                                               pclose(fp);
+                                             }
+                                             snprintf(out_name, max_len, "Disconnected");
+                                             *is_active = 1;
+                                           }
+
+                                           void toggle_wifi(int current_state) {
+                                             if (current_state) {
+                                               system("nmcli radio wifi off 2>/dev/null");
+                                             } else {
+                                               system("nmcli radio wifi on 2>/dev/null");
+                                             }
+                                           }
+
+                                           void get_bluetooth_name(char *out_name, int max_len, int *is_active) {
+                                             FILE *fp = popen("timeout 0.2s bluetoothctl info 2>/dev/null | grep 'Name:' | cut -d' ' -f2-", "r");
+                                             if (fp) {
+                                               if (fgets(out_name, max_len, fp) != NULL) {
+                                                 out_name[strcspn(out_name, "\r\n")] = 0;
+                                                 if (strlen(out_name) > 0) {
+                                                   *is_active = 1;
+                                                   pclose(fp);
+                                                   return;
+                                                 }
+                                               }
+                                               pclose(fp);
+                                             }
+                                             snprintf(out_name, max_len, "Not connected");
+                                             *is_active = 0;
+                                           }
+
+                                           void get_dnd_status(char *out_name, int max_len, int *is_active) {
+                                             FILE *fp = popen("dunstctl is-paused 2>/dev/null", "r");
+                                             if (fp) {
+                                               char buf[16] = {0};
+                                               if (fgets(buf, sizeof(buf), fp) != NULL) {
+                                                 if (strstr(buf, "true") != NULL) {
+                                                   snprintf(out_name, max_len, "On");
+                                                   *is_active = 1;
+                                                   pclose(fp);
+                                                   return;
+                                                 }
+                                               }
+                                               pclose(fp);
+                                             }
+                                             snprintf(out_name, max_len, "Off");
+                                             *is_active = 0;
+                                           }
+
+                                           void toggle_dnd() { system("dunstctl set-paused toggle 2>/dev/null"); }
+
+                                           void get_airplane_status(char *out_name, int max_len, int *is_active) {
+                                             FILE *fp = popen("rfkill list 2>/dev/null | grep -i 'Soft blocked: no'", "r");
+                                             if (fp) {
+                                               char buf[64] = {0};
+                                               if (fgets(buf, sizeof(buf), fp) == NULL) {
+                                                 snprintf(out_name, max_len, "On");
+                                                 *is_active = 1;
+                                                 pclose(fp);
+                                                 return;
+                                               }
+                                               pclose(fp);
+                                             }
+                                             snprintf(out_name, max_len, "Off");
+                                             *is_active = 0;
+                                           }
+
+                                           void toggle_airplane(int current_state) {
+                                             if (current_state) {
+                                               system("rfkill unblock all 2>/dev/null");
+                                               system("nmcli radio all on 2>/dev/null");
+                                             } else {
+                                               system("rfkill block all 2>/dev/null");
+                                             }
+                                           }
+
+                                           int get_system_volume() {
+                                             int vol = 75;
+                                             FILE *fp = popen("timeout 0.2s pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null", "r");
+                                             if (fp) {
+                                               char buf[256];
+                                               if (fgets(buf, sizeof(buf), fp) != NULL) {
+                                                 char *pct = strchr(buf, '%');
+                                                 if (pct) {
+                                                   char *start = pct;
+                                                   while (start > buf && *(start - 1) >= '0' && *(start - 1) <= '9') start--;
+                                                   sscanf(start, "%d", &vol);
+                                                 }
+                                               }
+                                               pclose(fp);
+                                             }
+                                             return (vol < 0) ? 0 : (vol > 100) ? 100 : vol;
+                                           }
+
+                                           int get_system_mic() {
+                                             int mic = 60;
+                                             FILE *fp = popen("timeout 0.2s pactl get-source-volume @DEFAULT_SOURCE@ 2>/dev/null", "r");
+                                             if (fp) {
+                                               char buf[256];
+                                               if (fgets(buf, sizeof(buf), fp) != NULL) {
+                                                 char *pct = strchr(buf, '%');
+                                                 if (pct) {
+                                                   char *start = pct;
+                                                   while (start > buf && *(start - 1) >= '0' && *(start - 1) <= '9') start--;
+                                                   sscanf(start, "%d", &mic);
+                                                 }
+                                               }
+                                               pclose(fp);
+                                             }
+                                             return (mic < 0) ? 0 : (mic > 100) ? 100 : mic;
+                                           }
+
+                                           void set_system_volume(int val) {
+                                             char cmd[128];
+                                             snprintf(cmd, sizeof(cmd), "pactl set-sink-volume @DEFAULT_SINK@ %d%% 2>/dev/null &", val);
+                                             system(cmd);
+                                           }
+
+                                           void set_system_mic(int val) {
+                                             char cmd[128];
+                                             snprintf(cmd, sizeof(cmd), "pactl set-source-volume @DEFAULT_SOURCE@ %d%% 2>/dev/null &", val);
+                                             system(cmd);
+                                           }
+
+                                           void update_device_statuses() {
+                                             get_wifi_name(tiles[0].status, sizeof(tiles[0].status), &tiles[0].active);
+                                             get_bluetooth_name(tiles[1].status, sizeof(tiles[1].status), &tiles[1].active);
+                                             get_dnd_status(tiles[2].status, sizeof(tiles[2].status), &tiles[2].active);
+                                             get_airplane_status(tiles[3].status, sizeof(tiles[3].status), &tiles[3].active);
+                                           }
+
+                                           // ================= SUB MENU WINDOW =================
+
+                                           void fetch_system_data(const char *cmd, char lines[15][128], int *line_count) {
+                                             FILE *fp = popen(cmd, "r");
+                                             *line_count = 0;
+                                             if (!fp) return;
+
+                                             char buffer[128];
+                                             while (fgets(buffer, sizeof(buffer), fp) != NULL && *line_count < 15) {
+                                               buffer[strcspn(buffer, "\r\n")] = 0;
+                                               if (strlen(buffer) > 0) {
+                                                 strncpy(lines[*line_count], buffer, 127);
+                                                 (*line_count)++;
+                                               }
+                                             }
+                                             pclose(fp);
+                                           }
+
+                                           void show_sub_menu(Display *d, int screen, const char *title, const char *cmd) {
+                                             char raw_items[15][128];
+                                             char formatted_items[15][128];
+                                             int item_count = 0;
+
+                                             fetch_system_data(cmd, raw_items, &item_count);
+
+                                             for (int i = 0; i < item_count; i++) {
+                                               char *colon = strrchr(raw_items[i], ':');
+                                               if (colon != NULL && colon != raw_items[i]) {
+                                                 *colon = '\0';
+                                                 char *name = raw_items[i];
+                                                 char *val = colon + 1;
+
+                                                 if (val[0] >= '0' && val[0] <= '9') {
+                                                   snprintf(formatted_items[i], sizeof(formatted_items[i]), "%s %s%%", name, val);
+                                                 } else {
+                                                   snprintf(formatted_items[i], sizeof(formatted_items[i]), "%s %s", name, val);
+                                                 }
+                                               } else {
+                                                 snprintf(formatted_items[i], sizeof(formatted_items[i]), "%s", raw_items[i]);
+                                               }
+                                             }
+
+                                             int sub_w = MAIN_WIDTH, sub_h = MAIN_HEIGHT;
+                                             int pos_x = DisplayWidth(d, screen) - sub_w - 15;
+                                             int pos_y = DisplayHeight(d, screen) - sub_h - 50;
+
+                                             XSetWindowAttributes attr;
+                                             attr.override_redirect = True;
+                                             attr.background_pixel = get_color(d, "#0b0f19");
+
+                                             Window sub_win = XCreateWindow(
+                                               d, RootWindow(d, screen), pos_x, pos_y, sub_w, sub_h, 0, CopyFromParent,
+                                                                            InputOutput, CopyFromParent, CWOverrideRedirect | CWBackPixel, &attr);
+
+                                             XSelectInput(d, sub_win, ExposureMask | ButtonPressMask | KeyPressMask);
+                                             XMapWindow(d, sub_win);
+
+                                             GC gc = XCreateGC(d, sub_win, 0, NULL);
+                                             XftDraw *xft_draw = XftDrawCreate(d, sub_win, DefaultVisual(d, screen),
+                                                                               DefaultColormap(d, screen));
+                                             XftFont *font_bold = XftFontOpenName(d, screen, "Sans:pixelsize=12:weight=bold");
+                                             XftFont *font_reg = XftFontOpenName(d, screen, "Sans:pixelsize=10");
+
+                                             XEvent ev;
+                                             int running = 1;
+
+                                             while (running) {
+                                               XNextEvent(d, &ev);
+
+                                               if (ev.type == Expose) {
+                                                 XSetForeground(d, gc, get_color(d, "#0b0f19"));
+                                                 XFillRectangle(d, sub_win, gc, 0, 0, sub_w, sub_h);
+
+                                                 XSetForeground(d, gc, get_color(d, "#131824"));
+                                                 draw_rounded_rectangle(d, sub_win, gc, 20, 20, 80, 32, 8, 1);
+                                                 draw_text(d, xft_draw, font_bold, "#3b82f6", 32, 41, "< Back");
+
+                                                 draw_text(d, xft_draw, font_bold, "#ffffff", 115, 41, title);
+
+                                                 XSetForeground(d, gc, get_color(d, "#1f293d"));
+                                                 XDrawLine(d, sub_win, gc, 20, 65, sub_w - 20, 65);
+
+                                                 if (item_count == 0) {
+                                                   draw_text(d, xft_draw, font_reg, "#94a3b8", 24, 100, "Scanning/No devices found...");
+                                                 } else {
+                                                   for (int i = 0; i < item_count && i < 8; i++) {
+                                                     XSetForeground(d, gc, get_color(d, "#131824"));
+                                                     draw_rounded_rectangle(d, sub_win, gc, 20, 80 + (i * 38), sub_w - 40, 32, 8, 1);
+                                                     draw_text(d, xft_draw, font_reg, "#f1f5f9", 32, 101 + (i * 38), formatted_items[i]);
+                                                   }
+                                                 }
+                                               }
+
+                                               if (ev.type == KeyPress) running = 0;
+                                               if (ev.type == ButtonPress) {
+                                                 if (ev.xbutton.button == 4 || ev.xbutton.button == 5) continue;
+                                                 if (ev.xbutton.x >= 20 && ev.xbutton.x <= 100 && ev.xbutton.y >= 20 && ev.xbutton.y <= 52) {
+                                                   running = 0;
+                                                 }
+                                               }
+                                             }
+
+                                             XftDrawDestroy(xft_draw);
+                                             XftFontClose(d, font_bold);
+                                             XftFontClose(d, font_reg);
+                                             XDestroyWindow(d, sub_win);
+                                           }
+
+                                           // ================= MAIN RENDER ENGINE =================
+
+                                           void draw_ui_to_pixmap(Display *d, Drawable pix, GC gc, XftDraw *xft_draw,
+                                                                  XftFont *font_bold, XftFont *font_regular) {
+                                             unsigned long bg_color = get_color(d, "#0b0f19");
+                                             XSetForeground(d, gc, bg_color);
+                                             XFillRectangle(d, pix, gc, 0, 0, MAIN_WIDTH, MAIN_HEIGHT);
+
+                                             draw_text(d, xft_draw, font_bold, "#3b82f6", 24, 32, "SYSTEM CONTROL");
+
+                                             for (int i = 0; i < 4; i++) {
+                                               unsigned long tile_bg;
+                                               if (tiles[i].active) {
+                                                 if (i == 3)
+                                                   tile_bg = get_color(d, "#064e3b");
+                                                 else
+                                                   tile_bg = get_color(d, "#1e3a8a");
+                                               } else {
+                                                 tile_bg = get_color(d, "#131824");
+                                               }
+
+                                               XSetForeground(d, gc, tile_bg);
+                                               draw_rounded_rectangle(d, pix, gc, tiles[i].x, tiles[i].y, tiles[i].w,
+                                                                      tiles[i].h, 14, 1);
+
+                                               const char *title_col = "#ffffff";
+                                               const char *sub_col = tiles[i].active ? "#93c5fd" : "#94a3b8";
+                                               if (i == 3 && tiles[i].active) sub_col = "#86efac";
+
+                                               draw_text(d, xft_draw, font_bold, title_col, tiles[i].x + 16, tiles[i].y + 26, tiles[i].label);
+                                               draw_text(d, xft_draw, font_regular, sub_col, tiles[i].x + 16, tiles[i].y + 46, tiles[i].status);
+
+                                               if (tiles[i].has_arrow) {
+                                                 draw_clean_arrow(d, pix, tiles[i].x + tiles[i].w - 24, tiles[i].y + 32, sub_col);
+                                               }
+                                             }
+
+                                             char vol_lbl[32];
+                                             snprintf(vol_lbl, sizeof(vol_lbl), "Volume (%d%%)", volume_val);
+                                             draw_text(d, xft_draw, font_bold, "#e2e8f0", 20, 240, vol_lbl);
+
+                                             int v_x = 20, v_y = 252, v_w = 440, v_h = 10;
+                                             XSetForeground(d, gc, get_color(d, "#131824"));
+                                             draw_rounded_rectangle(d, pix, gc, v_x, v_y, v_w, v_h, 5, 1);
+
+                                             int v_fill_w = (v_w * volume_val) / 100;
+                                             if (v_fill_w > 0) {
+                                               XSetForeground(d, gc, get_color(d, "#3b82f6"));
+                                               draw_rounded_rectangle(d, pix, gc, v_x, v_y, v_fill_w, v_h, 5, 1);
+                                             }
+
+                                             {
+                                               cairo_surface_t *surf = cairo_xlib_surface_create(d, pix, DefaultVisual(d, DefaultScreen(d)), MAIN_WIDTH, MAIN_HEIGHT);
+                                               cairo_t *cr = cairo_create(surf);
+                                               cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+                                               cairo_arc(cr, v_x + v_fill_w, v_y + v_h / 2.0, 7.0, 0, 2.0 * M_PI);
+                                               cairo_fill(cr);
+                                               cairo_destroy(cr);
+                                               cairo_surface_destroy(surf);
+                                             }
+
+                                             char mic_lbl[32];
+                                             snprintf(mic_lbl, sizeof(mic_lbl), "Microphone (%d%%)", mic_val);
+                                             draw_text(d, xft_draw, font_bold, "#e2e8f0", 20, 292, mic_lbl);
+
+                                             int m_x = 20, m_y = 304, m_w = 440, m_h = 10;
+                                             XSetForeground(d, gc, get_color(d, "#131824"));
+                                             draw_rounded_rectangle(d, pix, gc, m_x, m_y, m_w, m_h, 5, 1);
+
+                                             int m_fill_w = (m_w * mic_val) / 100;
+                                             if (m_fill_w > 0) {
+                                               XSetForeground(d, gc, get_color(d, "#10b981"));
+                                               draw_rounded_rectangle(d, pix, gc, m_x, m_y, m_fill_w, m_h, 5, 1);
+                                             }
+
+                                             {
+                                               cairo_surface_t *surf = cairo_xlib_surface_create(d, pix, DefaultVisual(d, DefaultScreen(d)), MAIN_WIDTH, MAIN_HEIGHT);
+                                               cairo_t *cr = cairo_create(surf);
+                                               cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+                                               cairo_arc(cr, m_x + m_fill_w, m_y + m_h / 2.0, 7.0, 0, 2.0 * M_PI);
+                                               cairo_fill(cr);
+                                               cairo_destroy(cr);
+                                               cairo_surface_destroy(surf);
+                                             }
+
+                                             const char *btn_labels[3] = {"Logout", "Restart", "Power Off"};
+                                             for (int b = 0; b < 3; b++) {
+                                               int bx = 20 + (b * 150);
+                                               int by = 338, bw = 140, bh = 42;
+
+                                               XSetForeground(d, gc, get_color(d, "#131824"));
+                                               draw_rounded_rectangle(d, pix, gc, bx, by, bw, bh, 10, 1);
+                                               draw_text(d, xft_draw, font_bold, "#f1f5f9", bx + 40, by + 26, btn_labels[b]);
+                                             }
+                                                                  }
+
+                                                                  void render_screen(Display *d, Window w, GC gc, Pixmap pix, XftDraw *xft_draw,
+                                                                                     XftFont *font_bold, XftFont *font_regular) {
+                                                                    draw_ui_to_pixmap(d, pix, gc, xft_draw, font_bold, font_regular);
+                                                                    XCopyArea(d, pix, w, gc, 0, 0, MAIN_WIDTH, MAIN_HEIGHT, 0, 0);
+                                                                    XFlush(d);
+                                                                                     }
+
+                                                                                     int is_on_interactive_element(int mx, int my) {
+                                                                                       for (int i = 0; i < 4; i++) {
+                                                                                         if (mx >= tiles[i].x && mx <= tiles[i].x + tiles[i].w &&
+                                                                                           my >= tiles[i].y && my <= tiles[i].y + tiles[i].h)
+                                                                                           return 1;
+                                                                                       }
+                                                                                       if (mx >= 20 && mx <= 460 && my >= 245 && my <= 275) return 1;
+                                                                                       if (mx >= 20 && mx <= 460 && my >= 295 && my <= 325) return 1;
+                                                                                       if (mx >= 20 && mx <= 160 && my >= 338 && my <= 380) return 1;
+                                                                                       if (mx >= 170 && mx <= 310 && my >= 338 && my <= 380) return 1;
+                                                                                       if (mx >= 320 && mx <= 460 && my >= 338 && my <= 380) return 1;
+                                                                                       return 0;
+                                                                                     }
+
+                                                                                     // ================= MAIN EVENT LOOP =================
+
+                                                                                     int main() {
+                                                                                       Display *d = XOpenDisplay(NULL);
+                                                                                       if (!d) {
+                                                                                         fprintf(stderr, "Error: Cannot open X Display\n");
+                                                                                         return 1;
+                                                                                       }
+
+                                                                                       int s = DefaultScreen(d);
+                                                                                       Window root = RootWindow(d, s);
+
+                                                                                       XftFont *font_bold = XftFontOpenName(d, s, "Sans:pixelsize=12:weight=bold");
+                                                                                       XftFont *font_regular = XftFontOpenName(d, s, "Sans:pixelsize=10");
+
+                                                                                       volume_val = get_system_volume();
+                                                                                       mic_val = get_system_mic();
+                                                                                       update_device_statuses();
+
+                                                                                       int pos_x = DisplayWidth(d, s) - MAIN_WIDTH - 15;
+                                                                                       int pos_y = DisplayHeight(d, s) - MAIN_HEIGHT - 50;
+
+                                                                                       XSetWindowAttributes attr;
+                                                                                       attr.override_redirect = True;
+                                                                                       attr.background_pixel = get_color(d, "#0b0f19");
+
+                                                                                       Window w = XCreateWindow(d, root, pos_x, pos_y, MAIN_WIDTH, MAIN_HEIGHT, 0,
+                                                                                                                CopyFromParent, InputOutput, CopyFromParent,
+                                                                                                                CWOverrideRedirect | CWBackPixel, &attr);
+
+                                                                                       XSelectInput(d, w, ExposureMask | ButtonPressMask | ButtonReleaseMask |
+                                                                                       PointerMotionMask | KeyPressMask);
+                                                                                       XMapWindow(d, w);
+
+                                                                                       XGrabKeyboard(d, w, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+                                                                                       XGrabPointer(d, w, True, ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+                                                                                                    GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+
+                                                                                       GC gc = XCreateGC(d, w, 0, NULL);
+                                                                                       Pixmap pix = XCreatePixmap(d, w, MAIN_WIDTH, MAIN_HEIGHT, DefaultDepth(d, s));
+                                                                                       XftDraw *xft_draw = XftDrawCreate(d, pix, DefaultVisual(d, s), DefaultColormap(d, s));
+
+                                                                                       XEvent e;
+                                                                                       while (1) {
+                                                                                         XNextEvent(d, &e);
+
+                                                                                         if (e.type == Expose) {
+                                                                                           render_screen(d, w, gc, pix, xft_draw, font_bold, font_regular);
+                                                                                         }
+                                                                                         if (e.type == KeyPress) {
+                                                                                           break;
+                                                                                         }
+                                                                                         if (e.type == ButtonPress) {
+                                                                                           if (e.xbutton.button == 4 || e.xbutton.button == 5) continue;
+
+                                                                                           int mx = e.xbutton.x, my = e.xbutton.y;
+
+                                                                                           if (!is_on_interactive_element(mx, my)) {
+                                                                                             break;
+                                                                                           }
+
+                                                                                           for (int i = 0; i < 4; i++) {
+                                                                                             if (mx >= tiles[i].x && mx <= tiles[i].x + tiles[i].w &&
+                                                                                               my >= tiles[i].y && my <= tiles[i].y + tiles[i].h) {
+
+                                                                                               if (tiles[i].has_arrow && mx >= (tiles[i].x + tiles[i].w - 35)) {
+                                                                                                 if (i == 0) {
+                                                                                                   show_sub_menu(d, s, "Wi-Fi Networks", "timeout 1s nmcli -t -f SSID,SIGNAL dev wifi 2>/dev/null");
+                                                                                                 } else if (i == 1) {
+                                                                                                   show_sub_menu(d, s, "Bluetooth Devices", "timeout 1s bluetoothctl devices 2>/dev/null");
+                                                                                                 }
+                                                                                               } else {
+                                                                                                 if (i == 0) toggle_wifi(tiles[0].active);
+                                                                                                 else if (i == 2) toggle_dnd();
+                                                                                                 else if (i == 3) toggle_airplane(tiles[3].active);
+                                                                                               }
+
+                                                                                               update_device_statuses();
+                                                                                               render_screen(d, w, gc, pix, xft_draw, font_bold, font_regular);
+                                                                                               }
+                                                                                           }
+
+                                                                                           if (mx >= 20 && mx <= 460 && my >= 245 && my <= 275) {
+                                                                                             is_dragging_vol = 1;
+                                                                                             volume_val = ((mx - 20) * 100) / 440;
+                                                                                             if (volume_val < 0) volume_val = 0;
+                                                                                             if (volume_val > 100) volume_val = 100;
+                                                                                             set_system_volume(volume_val);
+                                                                                             render_screen(d, w, gc, pix, xft_draw, font_bold, font_regular);
+                                                                                           }
+
+                                                                                           if (mx >= 20 && mx <= 460 && my >= 295 && my <= 325) {
+                                                                                             is_dragging_mic = 1;
+                                                                                             mic_val = ((mx - 20) * 100) / 440;
+                                                                                             if (mic_val < 0) mic_val = 0;
+                                                                                             if (mic_val > 100) mic_val = 100;
+                                                                                             set_system_mic(mic_val);
+                                                                                             render_screen(d, w, gc, pix, xft_draw, font_bold, font_regular);
+                                                                                           }
+
+                                                                                           if (mx >= 20 && mx <= 160 && my >= 338 && my <= 380) {
+                                                                                             system("pkill blackwm && pkill statusbar");
+                                                                                             break;
+                                                                                           }
+                                                                                           if (mx >= 170 && mx <= 310 && my >= 338 && my <= 380) {
+                                                                                             system("systemctl reboot || reboot");
+                                                                                             break;
+                                                                                           }
+                                                                                           if (mx >= 320 && mx <= 460 && my >= 338 && my <= 380) {
+                                                                                             system("systemctl poweroff || poweroff");
+                                                                                             break;
+                                                                                           }
+                                                                                         }
+
+                                                                                         if (e.type == MotionNotify) {
+                                                                                           int mx = e.xmotion.x, my = e.xmotion.y;
+
+                                                                                           if (is_dragging_vol) {
+                                                                                             int new_val = ((mx - 20) * 100) / 440;
+                                                                                             if (new_val < 0) new_val = 0;
+                                                                                             if (new_val > 100) new_val = 100;
+                                                                                             if (new_val != volume_val) {
+                                                                                               volume_val = new_val;
+                                                                                               set_system_volume(volume_val);
+                                                                                               render_screen(d, w, gc, pix, xft_draw, font_bold, font_regular);
+                                                                                             }
+                                                                                           } else if (is_dragging_mic) {
+                                                                                             int new_val = ((mx - 20) * 100) / 440;
+                                                                                             if (new_val < 0) new_val = 0;
+                                                                                             if (new_val > 100) new_val = 100;
+                                                                                             if (new_val != mic_val) {
+                                                                                               mic_val = new_val;
+                                                                                               set_system_mic(mic_val);
+                                                                                               render_screen(d, w, gc, pix, xft_draw, font_bold, font_regular);
+                                                                                             }
+                                                                                           }
+                                                                                         }
+
+                                                                                         if (e.type == ButtonRelease) {
+                                                                                           is_dragging_vol = 0;
+                                                                                           is_dragging_mic = 0;
+                                                                                         }
+                                                                                       }
+
+                                                                                       XUngrabPointer(d, CurrentTime);
+                                                                                       XUngrabKeyboard(d, CurrentTime);
+
+                                                                                       XftDrawDestroy(xft_draw);
+                                                                                       XftFontClose(d, font_bold);
+                                                                                       XftFontClose(d, font_regular);
+                                                                                       XFreePixmap(d, pix);
+                                                                                       XCloseDisplay(d);
+                                                                                       return 0;
+                                                                                     }
